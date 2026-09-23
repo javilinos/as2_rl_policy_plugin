@@ -82,6 +82,17 @@ const char * toString(ExitReason reason)
   return "unknown";
 }
 
+const char * toString(AfterRace after_race)
+{
+  switch (after_race) {
+    case AfterRace::Here:
+      return "here";
+    case AfterRace::Setpoint:
+      return "setpoint";
+  }
+  return "unknown";
+}
+
 MissionType missionTypeFromString(const std::string & name)
 {
   if (name == toString(MissionType::Race)) {
@@ -91,6 +102,17 @@ MissionType missionTypeFromString(const std::string & name)
     return MissionType::Hover;
   }
   throw std::invalid_argument("mission '" + name + "' is neither 'race' nor 'hover'");
+}
+
+AfterRace afterRaceFromString(const std::string & name)
+{
+  if (name == toString(AfterRace::Here)) {
+    return AfterRace::Here;
+  }
+  if (name == toString(AfterRace::Setpoint)) {
+    return AfterRace::Setpoint;
+  }
+  throw std::invalid_argument("after_race '" + name + "' is neither 'here' nor 'setpoint'");
 }
 
 std::string describe(const MissionEvent & event)
@@ -162,6 +184,11 @@ MissionConfig MissionController::validated(MissionConfig config, const PolicyBan
   require(std::isfinite(config.ceiling_m), "race.ceiling_m must be finite");
   require(config.exit_debounce_steps >= 1, "race.exit_debounce_steps must be at least 1");
   require(finite(config.hold_setpoint), "hold.setpoint must be finite");
+  if (config.type == MissionType::Race && config.after_race == AfterRace::Setpoint) {
+    require(
+      bounds.contains(config.hold_setpoint.position.x(), config.hold_setpoint.position.y()),
+      "hold.after_race is setpoint, so hold.setpoint must lie inside the course bounds in x and y");
+  }
   require(std::isfinite(config.min_altitude_m), "hold.min_altitude_m must be finite");
   require(
     config.mass_kg > 0.0 && std::isfinite(config.mass_kg), "vehicle.mass_kg must be positive");
@@ -348,10 +375,13 @@ void MissionController::exitRace(
   event.valid = update.valid;
   event.since_pass_s = static_cast<double>(sequencer_.stepsSincePass()) * dt();
   event.position = state.position;
+  const bool to_setpoint =
+    reason == ExitReason::Finished && config_.after_race == AfterRace::Setpoint;
+  const Gate pose = to_setpoint ? config_.hold_setpoint :
+    Gate{state.position, yawFromQuaternion(state.orientation)};
   hold(
-    clampSetpoint(
-      state.position.x(), state.position.y(), state.position.z(),
-      yawFromQuaternion(state.orientation)), reason, event);
+    clampSetpoint(pose.position.x(), pose.position.y(), pose.position.z(), pose.yaw), reason,
+    event);
 }
 
 void MissionController::hold(const Gate & setpoint, ExitReason reason, MissionEvent event)

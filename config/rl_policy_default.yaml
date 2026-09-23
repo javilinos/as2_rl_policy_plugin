@@ -33,8 +33,9 @@
         ceiling_m: 10.0
         exit_debounce_steps: 3
       hold:
-        setpoint: [0.0, 0.0, 1.5, 0.0] # x, y, z, yaw; used by the hover mission only
+        setpoint: [0.0, 0.0, 1.5, 0.0] # x, y, z, yaw; used by the hover mission and after_race: setpoint
         min_altitude_m: 1.0
+        after_race: here # here | setpoint: where the race's finish holds
       debug:
         status_topic: rl_policy/status # "" disables
         step_topic: rl_policy/step # "" disables

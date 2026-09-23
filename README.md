@@ -11,7 +11,8 @@ It takes TRAJECTORY (yaw angle) and gives BODY_RATES: collective thrust (N) and 
 - `as2_rl_policy_lib`: the `ControllerBase` plugin around it.
 
 Every race exit (laps done, a missed gate, no pass within the timeout, out of bounds, a HOVER
-mode request) ends in a hold at the current pose with the `hover` policy. Landing stays manual.
+mode request) ends in a hold at the current pose with the `hover` policy, or, for laps done with
+`hold.after_race: setpoint`, at `hold.setpoint`. Landing stays manual.
 
 ## Parameters
 

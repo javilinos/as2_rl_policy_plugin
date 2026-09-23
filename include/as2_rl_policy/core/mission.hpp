@@ -44,14 +44,26 @@ enum class ExitReason
   HoverRequest,
 };
 
+// Where the race's finish holds: the pose it ends at, or the hold setpoint.
+enum class AfterRace
+{
+  Here,
+  Setpoint,
+};
+
 const char * toString(Phase phase);
 
 const char * toString(MissionType type);
 
 const char * toString(ExitReason reason);
 
+const char * toString(AfterRace after_race);
+
 // Throws std::invalid_argument for anything but "race" or "hover".
 MissionType missionTypeFromString(const std::string & name);
+
+// Throws std::invalid_argument for anything but "here" or "setpoint".
+AfterRace afterRaceFromString(const std::string & name);
 
 struct MissionConfig
 {
@@ -66,6 +78,7 @@ struct MissionConfig
   double ceiling_m = 0.0;
   int exit_debounce_steps = 0;
   Gate hold_setpoint;
+  AfterRace after_race = AfterRace::Here;
   double min_altitude_m = 0.0;
   double mass_kg = 0.0;
 };

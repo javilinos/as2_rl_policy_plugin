@@ -73,6 +73,7 @@ std::vector<std::string> Plugin::initParameters() const
     "race.exit_debounce_steps",
     "hold.setpoint",
     "hold.min_altitude_m",
+    "hold.after_race",
   };
 }
 
@@ -241,6 +242,13 @@ void Plugin::readSettings(Settings & settings)
   }
   if (const auto * p = setting("hold.min_altitude_m", ParameterType::PARAMETER_DOUBLE)) {
     mission.min_altitude_m = p->as_double();
+  }
+  if (const auto * p = setting("hold.after_race", ParameterType::PARAMETER_STRING)) {
+    try {
+      mission.after_race = afterRaceFromString(p->as_string());
+    } catch (const std::invalid_argument & e) {
+      refuse(param("hold.after_race") + ": " + e.what());
+    }
   }
 }
 

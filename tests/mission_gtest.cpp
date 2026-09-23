@@ -11,6 +11,7 @@ namespace
 {
 
 using rl_policy::Action;
+using rl_policy::AfterRace;
 using rl_policy::ExitReason;
 using rl_policy::MissionConfig;
 using rl_policy::MissionController;
@@ -93,6 +94,16 @@ void expectZeroHistory(const Eigen::VectorXd & obs)
   for (int i = 20; i < 28; ++i) {
     EXPECT_EQ(obs(i), 0.0) << "entry " << i;
   }
+}
+
+// Passes gates 0 and 1 and approaches gate 2 along +x; `last` is the step that crosses gate 2.
+StepResult flyToTheLastGate(MissionController & mission, const VehicleState & last)
+{
+  const std::vector<double> xs = {4.8, 5.2, 9.8, 10.2, 14.8};
+  for (std::size_t i = 0; i < xs.size(); ++i) {
+    mission.step(at(xs[i], 0.0, 1.5), static_cast<double>(i) * kDt);
+  }
+  return mission.step(last, static_cast<double>(xs.size()) * kDt);
 }
 
 class Mission : public ::testing::Test
@@ -316,6 +327,102 @@ TEST_F(Mission, FinishHoldsWhereTheLastCrossingEnds) {
   EXPECT_EQ(hover->calls(), 21u);
 }
 
+TEST_F(Mission, FinishWithAfterRaceHereHoldsWhereTheLastLapEnds) {
+  EXPECT_EQ(MissionConfig().after_race, AfterRace::Here);
+  MissionConfig here = config(MissionType::Race, 1);
+  here.after_race = AfterRace::Here;
+  here.hold_setpoint.position = Eigen::Vector3d(-2.0, 3.0, 2.0);
+  here.hold_setpoint.yaw = 0.9;
+  MissionController mission(here, bank());
+  mission.start();
+  const StepResult last = flyToTheLastGate(mission, at(15.3, 0.2, 1.6, 0.2));
+  EXPECT_EQ(mission.phase(), Phase::Hold);
+  EXPECT_EQ(last.status.exit_reason, ExitReason::Finished);
+  EXPECT_NEAR(
+    (last.status.setpoint.position - Eigen::Vector3d(15.3, 0.2, 1.6)).norm(), 0.0,
+    1e-12);
+  EXPECT_NEAR(last.status.setpoint.yaw, 0.2, 1e-12);
+}
+
+TEST_F(Mission, FinishWithAfterRaceSetpointHoldsAtTheClampedSetpoint) {
+  MissionConfig to_setpoint = config(MissionType::Race, 1);
+  to_setpoint.after_race = AfterRace::Setpoint;
+  to_setpoint.hold_setpoint.position = Eigen::Vector3d(-2.0, 3.0, 0.4);
+  to_setpoint.hold_setpoint.yaw = 0.9;
+  MissionController mission(to_setpoint, bank());
+  mission.start();
+  const StepResult last = flyToTheLastGate(mission, at(15.3, 0.2, 1.6, 0.2));
+  EXPECT_EQ(mission.phase(), Phase::Hold);
+  EXPECT_EQ(last.status.exit_reason, ExitReason::Finished);
+  EXPECT_EQ(last.status.lap, 1);
+  EXPECT_EQ(last.status.gates_passed, 3);
+  EXPECT_EQ(last.status.policy, "hover");
+  const Eigen::Vector3d held(-2.0, 3.0, 1.0);
+  EXPECT_EQ(last.status.setpoint.position, held);
+  EXPECT_DOUBLE_EQ(last.status.setpoint.yaw, 0.9);
+  EXPECT_EQ(last.frame.position, held);
+  EXPECT_DOUBLE_EQ(last.frame.yaw, 0.9);
+
+  // The first hold step already observes the setpoint, with the new policy's history zeroed.
+  EXPECT_EQ(race->calls(), 5u);
+  EXPECT_EQ(hover->calls(), 1u);
+  EXPECT_EQ(hover->observations.back(), last.observation);
+  EXPECT_NEAR(
+    last.observation.head<3>().norm(), (Eigen::Vector3d(15.3, 0.2, 1.6) - held).norm(), 1e-5);
+  EXPECT_NEAR(last.observation(8), 0.2 - 0.9, 1e-6);
+  expectZeroHistory(last.observation);
+
+  const auto events = mission.takeEvents();
+  ASSERT_FALSE(events.empty());
+  const MissionEvent & finish = events.back();
+  EXPECT_EQ(finish.type, MissionEvent::Type::PhaseChange);
+  EXPECT_EQ(finish.reason, ExitReason::Finished);
+  EXPECT_EQ(finish.setpoint.position, held);
+  EXPECT_EQ(
+    rl_policy::describe(finish),
+    "Race finished: 1 laps, 3 gates (race -> hold): hold at [-2.000, 3.000, 1.000] yaw 0.900 "
+    "rad with policy 'hover'");
+}
+
+TEST_F(Mission, EveryOtherExitHoldsAtTheCurrentPoseWithAfterRaceSetpoint) {
+  MissionConfig to_setpoint = config();
+  to_setpoint.after_race = AfterRace::Setpoint;
+  to_setpoint.hold_setpoint.position = Eigen::Vector3d(-2.0, 3.0, 2.0);
+  to_setpoint.hold_setpoint.yaw = 0.9;
+
+  MissionController missed(to_setpoint, bank());
+  missed.start();
+  missed.step(at(4.8, 1.2, 1.5), 0.0);
+  missed.step(at(5.2, 1.2, 1.5, 0.1), kDt);
+  EXPECT_EQ(missed.status().exit_reason, ExitReason::Missed);
+  EXPECT_EQ(missed.status().setpoint.position, Eigen::Vector3d(5.2, 1.2, 1.5));
+  EXPECT_NEAR(missed.status().setpoint.yaw, 0.1, 1e-12);
+
+  MissionController timed_out(to_setpoint, bank());
+  timed_out.start();
+  for (int step = 0; timed_out.phase() == Phase::Race && step < 10000; ++step) {
+    timed_out.step(at(4.0, 0.0, 1.5), step * kDt);
+  }
+  EXPECT_EQ(timed_out.status().exit_reason, ExitReason::Timeout);
+  EXPECT_EQ(timed_out.status().setpoint.position, Eigen::Vector3d(4.0, 0.0, 1.5));
+
+  MissionController outside(to_setpoint, bank());
+  outside.start();
+  for (int step = 0; step < to_setpoint.exit_debounce_steps; ++step) {
+    outside.step(at(-10.6, 5.7, 1.5), step * kDt);
+  }
+  EXPECT_EQ(outside.status().exit_reason, ExitReason::OutOfBounds);
+  EXPECT_EQ(outside.status().setpoint.position, Eigen::Vector3d(-10.0, 5.0, 1.5));
+
+  MissionController requested(to_setpoint, bank());
+  requested.start();
+  requested.step(at(0.0, 0.0, 1.5), 0.0);
+  ASSERT_TRUE(requested.requestHold(40.0, 0.5, 0.3, 1.0));
+  EXPECT_EQ(requested.status().exit_reason, ExitReason::HoverRequest);
+  EXPECT_EQ(requested.status().setpoint.position, Eigen::Vector3d(30.0, 0.5, 1.0));
+  EXPECT_DOUBLE_EQ(requested.status().setpoint.yaw, 1.0);
+}
+
 TEST_F(Mission, AMissHoldsAtTheCurrentPose) {
   MissionController mission(config(), bank());
   mission.start();
@@ -439,4 +546,34 @@ TEST_F(Mission, RefusesAnIncompleteConfiguration) {
   EXPECT_THROW(MissionController(bad, bank()), std::invalid_argument);
   EXPECT_THROW(rl_policy::missionTypeFromString("land"), std::invalid_argument);
   EXPECT_EQ(rl_policy::missionTypeFromString("hover"), MissionType::Hover);
+}
+
+TEST_F(Mission, AfterRaceSetpointMustLieInsideTheBounds) {
+  MissionConfig to_setpoint = config();
+  to_setpoint.after_race = AfterRace::Setpoint;
+  to_setpoint.hold_setpoint.position = Eigen::Vector3d(30.5, 0.0, 1.5);
+  EXPECT_THROW(MissionController(to_setpoint, bank()), std::invalid_argument);
+  to_setpoint.hold_setpoint.position = Eigen::Vector3d(0.0, -5.5, 1.5);
+  EXPECT_THROW(MissionController(to_setpoint, bank()), std::invalid_argument);
+  // On the bounds is inside, and z is clamped like every hold, not refused.
+  to_setpoint.hold_setpoint.position = Eigen::Vector3d(30.0, -5.0, 0.0);
+  EXPECT_NO_THROW(MissionController(to_setpoint, bank()));
+
+  MissionConfig here = config();
+  here.hold_setpoint.position = Eigen::Vector3d(30.5, 0.0, 1.5);
+  EXPECT_NO_THROW(MissionController(here, bank()));
+
+  // The hover mission ignores after_race.
+  MissionConfig hover_config = config(MissionType::Hover);
+  hover_config.after_race = AfterRace::Setpoint;
+  hover_config.hold_setpoint.position = Eigen::Vector3d(40.0, -9.0, 0.2);
+  MissionController mission(hover_config, bank(false, true));
+  ASSERT_TRUE(mission.start());
+  EXPECT_EQ(mission.status().exit_reason, ExitReason::None);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(30.0, -5.0, 1.0));
+
+  EXPECT_EQ(rl_policy::afterRaceFromString("here"), AfterRace::Here);
+  EXPECT_EQ(rl_policy::afterRaceFromString("setpoint"), AfterRace::Setpoint);
+  EXPECT_THROW(rl_policy::afterRaceFromString("start"), std::invalid_argument);
+  EXPECT_THROW(rl_policy::afterRaceFromString(""), std::invalid_argument);
 }

@@ -216,6 +216,15 @@ protected:
     return plugin_->computeOutput(0.0, pose_out_, twist_out_, thrust_out_);
   }
 
+  // The status message the timer publishes once the node clock moves: the refusals, if any.
+  std::string statusMessage()
+  {
+    statuses_.clear();
+    setTime(1.0);
+    spin(std::chrono::milliseconds(300));
+    return statuses_.empty() ? std::string() : statuses_.back().message;
+  }
+
   std::shared_ptr<rclcpp::Node> helper_;
   rclcpp::Publisher<rosgraph_msgs::msg::Clock>::SharedPtr clock_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr motor_pub_;
@@ -317,6 +326,58 @@ TEST_F(PluginTest, HoverMissionNeedsOnlyTheHoverPolicy) {
   build(parameters);
   ASSERT_TRUE(plugin_->isReady());
   EXPECT_EQ(plugin_->mission()->config().type, rl_policy::MissionType::Hover);
+}
+
+TEST_F(PluginTest, AfterRaceIsHereOrASetpointInsideTheBounds) {
+  auto parameters = flightParameters(rl_policy_test::fixturePath(kPolicyFixture));
+  parameters = with(
+    parameters, rclcpp::Parameter("rl_policy.course.bounds_x", std::vector<double>{1.0, 22.0}));
+  parameters = with(
+    parameters, rclcpp::Parameter("rl_policy.course.bounds_y", std::vector<double>{1.0, 32.0}));
+  const auto after_race = [](const std::string & value) {
+      return rclcpp::Parameter("rl_policy.hold.after_race", value);
+    };
+  const auto hold_at = [](double x, double y) {
+      return rclcpp::Parameter("rl_policy.hold.setpoint", std::vector<double>{x, y, 0.2, 3.14});
+    };
+  const auto inside = with(parameters, hold_at(14.5, 2.0));
+
+  build(with(inside, after_race("start")));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_FALSE(plugin_->setMode(kTrajectory, kBodyRates));
+  EXPECT_NE(statusMessage().find("'start' is neither 'here' nor 'setpoint'"), std::string::npos);
+
+  build(with(inside, rclcpp::Parameter("rl_policy.hold.after_race", 1)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_FALSE(plugin_->setMode(kTrajectory, kBodyRates));
+  EXPECT_NE(statusMessage().find("hold.after_race must be of type string"), std::string::npos);
+
+  build(
+    with(
+      inside,
+      rclcpp::Parameter("rl_policy.hold.after_race", std::vector<std::string>{"setpoint"})));
+  EXPECT_FALSE(plugin_->isReady());
+
+  build(with(inside, after_race("setpoint")));
+  ASSERT_TRUE(plugin_->isReady());
+  EXPECT_EQ(plugin_->mission()->config().after_race, rl_policy::AfterRace::Setpoint);
+  EXPECT_EQ(
+    plugin_->mission()->config().hold_setpoint.position, Eigen::Vector3d(14.5, 2.0, 0.2));
+  EXPECT_TRUE(plugin_->setMode(kTrajectory, kBodyRates));
+
+  for (const auto & outside : {hold_at(22.5, 2.0), hold_at(14.5, 0.5), hold_at(0.0, 0.0)}) {
+    build(with(with(parameters, outside), after_race("setpoint")));
+    EXPECT_FALSE(plugin_->isReady()) << outside.value_to_string();
+    EXPECT_FALSE(plugin_->setMode(kTrajectory, kBodyRates));
+    EXPECT_NE(
+      statusMessage().find("hold.setpoint must lie inside the course bounds"), std::string::npos)
+      << outside.value_to_string();
+  }
+
+  // With here the race never holds at the setpoint, so the bounds do not constrain it.
+  build(with(with(parameters, hold_at(22.5, 2.0)), after_race("here")));
+  ASSERT_TRUE(plugin_->isReady());
+  EXPECT_EQ(plugin_->mission()->config().after_race, rl_policy::AfterRace::Here);
 }
 
 TEST_F(PluginTest, ReferenceIsMarkedAfterResetAndAState) {
