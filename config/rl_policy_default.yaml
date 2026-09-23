@@ -1,0 +1,40 @@
+/**:
+  ros__parameters:
+    plugin_name: rl_policy
+    cmd_freq: 100.0 # must equal 1 / dt of the policies
+    info_freq: 10.0 # also the rate of the status topic
+    use_bypass: false
+    desired_pose_frame: /earth
+    desired_twist_frame: /earth
+    rl_policy:
+      config_version: 1
+      mission: race # race | hover
+      policies:
+        names: [race, hover] # race mission: race + hover; hover mission: hover
+        files: ["", ""] # exported quadlab_policy files, absolute paths
+      vehicle:
+        mass_kg: 1.131 # the platform's mass, which re-dimensionalizes the thrust
+      motor_speed:
+        topic: sensor_measurements/motor_speed
+        timeout_s: 0.1
+      course: # timed gates in pass order, world ENU, yaw in rad
+        gates_x: [12.5, 6.5]
+        gates_y: [2.0, 6.0]
+        gates_z: [1.45, 1.45]
+        gates_yaw: [3.141593, 2.356194]
+        bounds_x: [1.0, 22.0]
+        bounds_y: [1.0, 32.0]
+      race:
+        laps: 3
+        pass_tolerance_m: 0.9
+        valid_half_m: 0.4 # reported in the status only
+        gate_timeout_s: 5.0
+        bounds_margin_m: 0.5
+        ceiling_m: 10.0
+        exit_debounce_steps: 3
+      hold:
+        setpoint: [0.0, 0.0, 1.5, 0.0] # x, y, z, yaw; used by the hover mission only
+        min_altitude_m: 1.0
+      debug:
+        status_topic: rl_policy/status # "" disables
+        step_topic: rl_policy/step # "" disables

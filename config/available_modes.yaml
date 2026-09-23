@@ -1,0 +1,6 @@
+# Control modes: 4 bits of mode, 2 of yaw, 2 reserved (see as2_motion_controller)
+output_control_modes:
+  - 0b00100100 # BODY_RATES (p, q, r, thrust)
+
+input_control_modes:
+  - 0b01110000 # TRAJECTORY with yaw ANGLE

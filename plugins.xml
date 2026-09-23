@@ -1,0 +1,7 @@
+<class_libraries>
+    <library path="as2_rl_policy_lib">
+        <class type="rl_policy::Plugin" base_class_type="as2_motion_controller_plugin_base::ControllerBase">
+            <description>Controller plugin that flies quadlab's exported rates policies: a race for N laps, then a hover.</description>
+        </class>
+    </library>
+</class_libraries>
