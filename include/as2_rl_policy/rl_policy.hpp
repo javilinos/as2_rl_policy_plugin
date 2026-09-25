@@ -89,6 +89,9 @@ private:
 
   const rclcpp::Parameter * setting(const std::string & tail, rclcpp::ParameterType type);
 
+  // Null, and no refusal, when no file sets it.
+  const rclcpp::Parameter * optionalSetting(const std::string & tail, rclcpp::ParameterType type);
+
   void refuse(const std::string & reason);
 
   void motorSpeedCallback(const sensor_msgs::msg::JointState::SharedPtr msg);

@@ -179,6 +179,12 @@ MissionConfig MissionController::validated(MissionConfig config, const PolicyBan
   require(config.laps >= 1, "race.laps must be at least 1");
   require(config.pass_tolerance_m > 0.0, "race.pass_tolerance_m must be positive");
   require(config.valid_half_m > 0.0, "race.valid_half_m must be positive");
+  require(
+    !config.octagon_pass_tolerance_m || *config.octagon_pass_tolerance_m > 0.0,
+    "race.octagon_pass_tolerance_m must be positive");
+  require(
+    !config.octagon_valid_half_m || *config.octagon_valid_half_m > 0.0,
+    "race.octagon_valid_half_m must be positive");
   require(config.gate_timeout_s > 0.0, "race.gate_timeout_s must be positive");
   require(config.bounds_margin_m >= 0.0, "race.bounds_margin_m must not be negative");
   require(std::isfinite(config.ceiling_m), "race.ceiling_m must be finite");
@@ -201,7 +207,8 @@ MissionController::MissionController(MissionConfig config, PolicyBank policies)
   sequencer_(
     Course(config_.gates, config_.bounds),
     SequencerConfig{config_.laps, config_.pass_tolerance_m, config_.valid_half_m,
-      config_.gate_timeout_s, policies_.dt()}),
+      config_.gate_timeout_s, policies_.dt(), config_.octagon_pass_tolerance_m,
+      config_.octagon_valid_half_m}),
   hold_course_(Course::single(config_.hold_setpoint))
 {
 }

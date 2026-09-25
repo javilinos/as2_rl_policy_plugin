@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -73,6 +74,9 @@ struct MissionConfig
   int laps = 0;
   double pass_tolerance_m = 0.0;
   double valid_half_m = 0.0;
+  // Unset, the square's values.
+  std::optional<double> octagon_pass_tolerance_m;
+  std::optional<double> octagon_valid_half_m;
   double gate_timeout_s = 0.0;
   double bounds_margin_m = 0.0;
   double ceiling_m = 0.0;

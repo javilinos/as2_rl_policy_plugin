@@ -20,6 +20,23 @@ constexpr int64_t kConfigVersion = 1;
 // cmd_freq times the policy dt must be one to this tolerance.
 constexpr double kStepRateTolerance = 1.0e-6;
 
+// Read when the plugin is built, like initParameters(), but absent from a file they default.
+const std::vector<std::string> & optionalInitParameters()
+{
+  static const std::vector<std::string> tails = {
+    "course.gates_shape",
+    "race.octagon_pass_tolerance_m",
+    "race.octagon_valid_half_m",
+  };
+  return tails;
+}
+
+bool isOptionalInitParameter(const std::string & tail)
+{
+  const std::vector<std::string> & tails = optionalInitParameters();
+  return std::find(tails.begin(), tails.end(), tail) != tails.end();
+}
+
 std::string text(double value)
 {
   return std::to_string(value);
@@ -79,6 +96,17 @@ std::vector<std::string> Plugin::initParameters() const
 
 void Plugin::updateParameter(const std::string & name, const rclcpp::Parameter & parameter)
 {
+  if (isOptionalInitParameter(name)) {
+    // The dispatch that follows initialize() repeats what ownInitialize() read.
+    const auto it = parameters_.find(name);
+    if (it == parameters_.end() || it->second != parameter) {
+      RCLCPP_WARN(
+        getNodePtr()->get_logger(),
+        "Parameter '%s' is applied when the plugin is built, the change has no effect",
+        param(name).c_str());
+    }
+    return;
+  }
   const std::vector<std::string> tails = initParameters();
   if (std::find(tails.begin(), tails.end(), name) == tails.end()) {
     RCLCPP_WARN(
@@ -119,6 +147,16 @@ const rclcpp::Parameter * Plugin::setting(const std::string & tail, rclcpp::Para
     return nullptr;
   }
   return &it->second;
+}
+
+const rclcpp::Parameter * Plugin::optionalSetting(
+  const std::string & tail, rclcpp::ParameterType type)
+{
+  if (!getNodePtr()->has_parameter(param(tail))) {
+    return nullptr;
+  }
+  parameters_.insert_or_assign(tail, getNodePtr()->get_parameter(param(tail)));
+  return setting(tail, type);
 }
 
 void Plugin::readSettings(Settings & settings)
@@ -189,6 +227,27 @@ void Plugin::readSettings(Settings & settings)
       }
     }
   }
+  const auto * shapes =
+    optionalSetting("course.gates_shape", ParameterType::PARAMETER_INTEGER_ARRAY);
+  if (shapes && !mission.gates.empty()) {
+    const std::vector<int64_t> values = shapes->as_integer_array();
+    if (values.size() != mission.gates.size()) {
+      refuse(
+        param("course.gates_shape") + " has " + std::to_string(values.size()) +
+        " entries, the course has " + std::to_string(mission.gates.size()) + " gates");
+    }
+    for (std::size_t i = 0; i < values.size() && i < mission.gates.size(); ++i) {
+      if (values[i] == static_cast<int64_t>(GateShape::Square)) {
+        mission.gates[i].shape = GateShape::Square;
+      } else if (values[i] == static_cast<int64_t>(GateShape::Octagon)) {
+        mission.gates[i].shape = GateShape::Octagon;
+      } else {
+        refuse(
+          param("course.gates_shape") + " entry " + std::to_string(i) + " is " +
+          std::to_string(values[i]) + ": 0 is a square, 1 an octagon");
+      }
+    }
+  }
   if (const auto * p = setting("course.bounds_x", ParameterType::PARAMETER_DOUBLE_ARRAY)) {
     const auto values = p->as_double_array();
     if (values.size() != 2) {
@@ -217,6 +276,16 @@ void Plugin::readSettings(Settings & settings)
   }
   if (const auto * p = setting("race.valid_half_m", ParameterType::PARAMETER_DOUBLE)) {
     mission.valid_half_m = p->as_double();
+  }
+  if (const auto * p =
+    optionalSetting("race.octagon_pass_tolerance_m", ParameterType::PARAMETER_DOUBLE))
+  {
+    mission.octagon_pass_tolerance_m = p->as_double();
+  }
+  if (const auto * p =
+    optionalSetting("race.octagon_valid_half_m", ParameterType::PARAMETER_DOUBLE))
+  {
+    mission.octagon_valid_half_m = p->as_double();
   }
   if (const auto * p = setting("race.gate_timeout_s", ParameterType::PARAMETER_DOUBLE)) {
     mission.gate_timeout_s = p->as_double();

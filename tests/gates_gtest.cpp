@@ -2,7 +2,9 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <vector>
 
 #include "as2_rl_policy/core/course.hpp"
@@ -185,4 +187,94 @@ TEST(Sequencer, BackwardCrossingDoesNotCount) {
   EXPECT_EQ(update.event, GateEvent::None);
   EXPECT_FALSE(update.crossing.crossed);
   EXPECT_EQ(sequencer.stepsSincePass(), 1);
+}
+
+TEST(Crossing, OpeningNormOfEachShape) {
+  using rl_policy::GateShape;
+  EXPECT_DOUBLE_EQ(rl_policy::openingNorm(GateShape::Square, 0.3, -0.5), 0.5);
+  EXPECT_DOUBLE_EQ(rl_policy::openingNorm(GateShape::Square, 0.5, 0.5), 0.5);
+  // Along a flat the octagon's norm is the square's; towards a corner the diagonal edge binds.
+  EXPECT_DOUBLE_EQ(rl_policy::openingNorm(GateShape::Octagon, -0.8, 0.1), 0.8);
+  EXPECT_DOUBLE_EQ(rl_policy::openingNorm(GateShape::Octagon, 0.5, -0.5), 1.0 / std::sqrt(2.0));
+  const double t = std::sqrt(2.0) - 1.0;
+  EXPECT_NEAR(rl_policy::openingNorm(GateShape::Octagon, 0.95, 0.95 * t), 0.95, 1e-12);
+  EXPECT_NEAR(rl_policy::openingNorm(GateShape::Octagon, -0.95 * t, 0.95), 0.95, 1e-12);
+}
+
+TEST(Sequencer, EverySquareIsJudgedOnItsWorseAxis) {
+  const Course course = seasonTwo();
+  for (int i = -12; i <= 12; ++i) {
+    for (int j = -12; j <= 12; ++j) {
+      // Off the grid so that no sample sits on a window's edge.
+      const double lateral = 0.1 * i + 0.013;
+      const double vertical = 0.1 * j + 0.013;
+      const double worst = std::max(std::abs(lateral), std::abs(vertical));
+      GateSequencer sequencer(course, sequencerConfig(1));
+      const rl_policy::GateUpdate update = passTarget(sequencer, lateral, vertical);
+      EXPECT_EQ(update.event, worst < 0.9 ? GateEvent::Passed : GateEvent::Missed)
+        << lateral << ", " << vertical;
+      EXPECT_EQ(update.valid, worst < 0.4) << lateral << ", " << vertical;
+    }
+  }
+}
+
+TEST(Sequencer, AnOctagonIsJudgedByItsOwnNormAndWindows) {
+  std::vector<Gate> gates = rl_policy_test::courseGates(
+    rl_policy_test::loadFixture("obs_season2.yaml")["course"]);
+  gates[0].shape = rl_policy::GateShape::Octagon;
+  const Course course(gates);
+  rl_policy::SequencerConfig config = sequencerConfig(1);
+  config.pass_tolerance_m = 1.0;
+  config.valid_half_m = 0.5;
+  config.octagon_pass_tolerance_m = 1.1;
+  config.octagon_valid_half_m = 0.6;
+  const auto through = [&](double lateral, double vertical) {
+      GateSequencer sequencer(course, config);
+      return passTarget(sequencer, lateral, vertical);
+    };
+
+  // Through a flat, out to the octagon's own tolerance, past the square's.
+  const rl_policy::GateUpdate flat = through(1.05, 0.0);
+  EXPECT_EQ(flat.event, GateEvent::Passed);
+  EXPECT_FALSE(flat.valid);
+  // A corner the octagon cuts off: inside the square of the same tolerance, outside the octagon.
+  const rl_policy::GateUpdate corner = through(0.85, -0.85);
+  EXPECT_EQ(corner.event, GateEvent::Missed);
+  EXPECT_FALSE(corner.valid);
+  // Beside the cut corner, inside its diagonal edge: (0.7 + 0.6) / sqrt(2) = 0.919.
+  EXPECT_EQ(through(0.7, 0.6).event, GateEvent::Passed);
+  // The valid window is an apothem too.
+  const rl_policy::GateUpdate centred = through(0.5, 0.2);
+  EXPECT_EQ(centred.event, GateEvent::Passed);
+  EXPECT_TRUE(centred.valid);
+  const rl_policy::GateUpdate diagonal = through(0.45, 0.45);
+  EXPECT_EQ(diagonal.event, GateEvent::Passed);
+  EXPECT_FALSE(diagonal.valid);
+
+  // The gates after it are squares, held to the square's tolerance.
+  GateSequencer sequencer(course, config);
+  ASSERT_EQ(passTarget(sequencer, 0.0, 0.0).event, GateEvent::Passed);
+  ASSERT_EQ(sequencer.target(), 1u);
+  EXPECT_EQ(passTarget(sequencer, 0.85, -0.85).event, GateEvent::Passed);
+  EXPECT_EQ(passTarget(sequencer, 1.05, 0.0).event, GateEvent::Missed);
+}
+
+TEST(Sequencer, AnOctagonTakesTheSquareWindowsUnlessGivenItsOwn) {
+  std::vector<Gate> gates = rl_policy_test::courseGates(
+    rl_policy_test::loadFixture("obs_season2.yaml")["course"]);
+  gates[0].shape = rl_policy::GateShape::Octagon;
+  const rl_policy::SequencerConfig config = sequencerConfig(1);
+  EXPECT_DOUBLE_EQ(config.passTolerance(rl_policy::GateShape::Octagon), 0.9);
+  EXPECT_DOUBLE_EQ(config.validHalf(rl_policy::GateShape::Octagon), 0.4);
+
+  // The same windows, in the octagon's norm: 0.919 is past a 0.9 tolerance.
+  GateSequencer sequencer(Course(gates), config);
+  EXPECT_EQ(passTarget(sequencer, 0.7, 0.6).event, GateEvent::Missed);
+
+  rl_policy::SequencerConfig zero = config;
+  zero.octagon_pass_tolerance_m = 0.0;
+  EXPECT_THROW(GateSequencer(Course(gates), zero), std::invalid_argument);
+  rl_policy::SequencerConfig negative = config;
+  negative.octagon_valid_half_m = -0.6;
+  EXPECT_THROW(GateSequencer(Course(gates), negative), std::invalid_argument);
 }

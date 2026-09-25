@@ -548,6 +548,32 @@ TEST_F(Mission, RefusesAnIncompleteConfiguration) {
   EXPECT_EQ(rl_policy::missionTypeFromString("hover"), MissionType::Hover);
 }
 
+TEST_F(Mission, OctagonWindowsReachTheSequencer) {
+  MissionController square_only(config(), bank());
+  const rl_policy::SequencerConfig & defaults = square_only.sequencer().config();
+  EXPECT_FALSE(defaults.octagon_pass_tolerance_m.has_value());
+  EXPECT_DOUBLE_EQ(defaults.passTolerance(rl_policy::GateShape::Octagon), 0.9);
+  EXPECT_DOUBLE_EQ(defaults.validHalf(rl_policy::GateShape::Octagon), 0.4);
+
+  MissionConfig octagons = config();
+  octagons.gates[1].shape = rl_policy::GateShape::Octagon;
+  octagons.octagon_pass_tolerance_m = 1.1;
+  octagons.octagon_valid_half_m = 0.6;
+  MissionController mission(octagons, bank());
+  const rl_policy::SequencerConfig & given = mission.sequencer().config();
+  EXPECT_DOUBLE_EQ(given.passTolerance(rl_policy::GateShape::Octagon), 1.1);
+  EXPECT_DOUBLE_EQ(given.validHalf(rl_policy::GateShape::Octagon), 0.6);
+  EXPECT_DOUBLE_EQ(given.passTolerance(rl_policy::GateShape::Square), 0.9);
+  EXPECT_EQ(mission.sequencer().course().gate(1).shape, rl_policy::GateShape::Octagon);
+
+  MissionConfig bad = octagons;
+  bad.octagon_pass_tolerance_m = 0.0;
+  EXPECT_THROW(MissionController(bad, bank()), std::invalid_argument);
+  bad = octagons;
+  bad.octagon_valid_half_m = -0.6;
+  EXPECT_THROW(MissionController(bad, bank()), std::invalid_argument);
+}
+
 TEST_F(Mission, AfterRaceSetpointMustLieInsideTheBounds) {
   MissionConfig to_setpoint = config();
   to_setpoint.after_race = AfterRace::Setpoint;

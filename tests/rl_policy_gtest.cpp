@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <string>
@@ -311,6 +312,83 @@ TEST_F(PluginTest, RefusesParametersOfTheWrongType) {
     with(
       parameters,
       rclcpp::Parameter("rl_policy.policies.names", std::vector<std::string>{"race", "other"})));
+  EXPECT_FALSE(plugin_->isReady());
+}
+
+TEST_F(PluginTest, WithoutShapesEveryGateIsASquareAndTheOctagonWindowsTheSquareOnes) {
+  build(flightParameters(rl_policy_test::fixturePath(kPolicyFixture)));
+  ASSERT_TRUE(plugin_->isReady());
+  const rl_policy::MissionConfig & config = plugin_->mission()->config();
+  for (const rl_policy::Gate & gate : config.gates) {
+    EXPECT_EQ(gate.shape, rl_policy::GateShape::Square);
+  }
+  EXPECT_FALSE(config.octagon_pass_tolerance_m.has_value());
+  EXPECT_FALSE(config.octagon_valid_half_m.has_value());
+  const rl_policy::SequencerConfig & sequencer = plugin_->mission()->sequencer().config();
+  EXPECT_DOUBLE_EQ(
+    sequencer.passTolerance(rl_policy::GateShape::Octagon),
+    node_->get_parameter("rl_policy.race.pass_tolerance_m").as_double());
+  EXPECT_DOUBLE_EQ(
+    sequencer.validHalf(rl_policy::GateShape::Octagon),
+    node_->get_parameter("rl_policy.race.valid_half_m").as_double());
+}
+
+TEST_F(PluginTest, ReadsTheShapeOfEachGateAndTheOctagonWindows) {
+  std::vector<int64_t> shapes(12, 0);
+  shapes[2] = 1;
+  shapes[11] = 1;
+  auto parameters = flightParameters(rl_policy_test::fixturePath(kPolicyFixture));
+  parameters = with(parameters, rclcpp::Parameter("rl_policy.course.gates_shape", shapes));
+  parameters = with(parameters, rclcpp::Parameter("rl_policy.race.pass_tolerance_m", 1.0));
+  parameters = with(parameters, rclcpp::Parameter("rl_policy.race.octagon_pass_tolerance_m", 1.1));
+  parameters = with(parameters, rclcpp::Parameter("rl_policy.race.octagon_valid_half_m", 0.6));
+  build(parameters);
+  ASSERT_TRUE(plugin_->isReady());
+  const rl_policy::MissionConfig & config = plugin_->mission()->config();
+  ASSERT_EQ(config.gates.size(), 12u);
+  for (std::size_t i = 0; i < config.gates.size(); ++i) {
+    EXPECT_EQ(
+      config.gates[i].shape,
+      shapes[i] == 1 ? rl_policy::GateShape::Octagon : rl_policy::GateShape::Square) << i;
+  }
+  const rl_policy::SequencerConfig & sequencer = plugin_->mission()->sequencer().config();
+  EXPECT_DOUBLE_EQ(sequencer.passTolerance(rl_policy::GateShape::Square), 1.0);
+  EXPECT_DOUBLE_EQ(sequencer.passTolerance(rl_policy::GateShape::Octagon), 1.1);
+  EXPECT_DOUBLE_EQ(sequencer.validHalf(rl_policy::GateShape::Octagon), 0.6);
+  EXPECT_DOUBLE_EQ(
+    sequencer.validHalf(rl_policy::GateShape::Square),
+    node_->get_parameter("rl_policy.race.valid_half_m").as_double());
+}
+
+TEST_F(PluginTest, RefusesShapesAndOctagonWindowsThatDoNotFit) {
+  const auto parameters = flightParameters(rl_policy_test::fixturePath(kPolicyFixture));
+  const auto shapes = [](std::vector<int64_t> values) {
+      return rclcpp::Parameter("rl_policy.course.gates_shape", values);
+    };
+  build(with(parameters, shapes(std::vector<int64_t>(11, 0))));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("has 11 entries, the course has 12 gates"), std::string::npos);
+
+  std::vector<int64_t> unknown(12, 0);
+  unknown[4] = 2;
+  build(with(parameters, shapes(unknown)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("entry 4 is 2"), std::string::npos);
+
+  build(
+    with(
+      parameters,
+      rclcpp::Parameter("rl_policy.course.gates_shape", std::vector<double>(12, 0.0))));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("course.gates_shape must be of type"), std::string::npos);
+
+  build(with(parameters, rclcpp::Parameter("rl_policy.race.octagon_pass_tolerance_m", 1)));
+  EXPECT_FALSE(plugin_->isReady());
+  build(with(parameters, rclcpp::Parameter("rl_policy.race.octagon_pass_tolerance_m", 0.0)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(
+    statusMessage().find("race.octagon_pass_tolerance_m must be positive"), std::string::npos);
+  build(with(parameters, rclcpp::Parameter("rl_policy.race.octagon_valid_half_m", -0.4)));
   EXPECT_FALSE(plugin_->isReady());
 }
 

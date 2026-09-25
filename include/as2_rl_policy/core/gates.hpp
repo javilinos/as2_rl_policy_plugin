@@ -4,6 +4,7 @@
 #include <Eigen/Dense>
 
 #include <cstddef>
+#include <optional>
 
 #include "as2_rl_policy/core/course.hpp"
 
@@ -22,6 +23,9 @@ struct Crossing
 Crossing planeCrossing(
   const Eigen::Vector3d & previous, const Eigen::Vector3d & current, const Gate & gate);
 
+// max(|lateral|, |vertical|); an octagon's norm also takes (|lateral| + |vertical|) / sqrt(2).
+double openingNorm(GateShape shape, double lateral, double vertical);
+
 struct SequencerConfig
 {
   int laps = 0;
@@ -29,6 +33,13 @@ struct SequencerConfig
   double valid_half_m = 0.0;
   double gate_timeout_s = 0.0;
   double dt = 0.0;
+  // Unset, an octagon is held to the square's tolerance and window, in its own norm.
+  std::optional<double> octagon_pass_tolerance_m;
+  std::optional<double> octagon_valid_half_m;
+
+  double passTolerance(GateShape shape) const;
+
+  double validHalf(GateShape shape) const;
 };
 
 enum class GateEvent

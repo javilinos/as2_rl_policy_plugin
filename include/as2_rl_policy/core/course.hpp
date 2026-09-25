@@ -10,10 +10,18 @@
 namespace rl_policy
 {
 
+// An octagon has its flats on the gate's lateral and vertical axes.
+enum class GateShape
+{
+  Square = 0,
+  Octagon = 1,
+};
+
 struct Gate
 {
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
   double yaw = 0.0;
+  GateShape shape = GateShape::Square;
 };
 
 struct Bounds
