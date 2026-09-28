@@ -52,6 +52,33 @@ enum class AfterRace
   Setpoint,
 };
 
+// What the hover mission holds: the last sent reference, else hold.setpoint; or hold.setpoint.
+enum class HoldReference
+{
+  SentOrConfigured,
+  Configured,
+};
+
+// Where a hold setpoint came from: hold.setpoint, a sent reference or the pose at the time.
+enum class SetpointSource
+{
+  None,
+  Configured,
+  Sent,
+  Here,
+};
+
+// What updateHoldReference() did with a sent reference.
+enum class ReferenceUpdate
+{
+  IgnoredRace,
+  IgnoredConfigured,
+  NotFinite,
+  Unchanged,
+  Pending,
+  Moved,
+};
+
 const char * toString(Phase phase);
 
 const char * toString(MissionType type);
@@ -60,11 +87,18 @@ const char * toString(ExitReason reason);
 
 const char * toString(AfterRace after_race);
 
+const char * toString(HoldReference reference);
+
+const char * toString(SetpointSource source);
+
 // Throws std::invalid_argument for anything but "race" or "hover".
 MissionType missionTypeFromString(const std::string & name);
 
 // Throws std::invalid_argument for anything but "here" or "setpoint".
 AfterRace afterRaceFromString(const std::string & name);
+
+// Throws std::invalid_argument for anything but "sent_or_configured" or "configured".
+HoldReference holdReferenceFromString(const std::string & name);
 
 struct MissionConfig
 {
@@ -83,6 +117,7 @@ struct MissionConfig
   int exit_debounce_steps = 0;
   Gate hold_setpoint;
   AfterRace after_race = AfterRace::Here;
+  HoldReference hold_reference = HoldReference::SentOrConfigured;
   double min_altitude_m = 0.0;
   double mass_kg = 0.0;
 };
@@ -107,7 +142,9 @@ struct MissionStatus
   CrossingRecord last_crossing;
   ExitReason exit_reason = ExitReason::None;
   bool holding = false;
+  // The hold's setpoint in Hold; the hover mission's pending one in Idle.
   Gate setpoint;
+  SetpointSource setpoint_source = SetpointSource::None;
   std::uint64_t steps = 0;
 };
 
@@ -117,6 +154,7 @@ struct MissionEvent
   {
     PhaseChange,
     GatePassed,
+    SetpointChange,
   };
 
   Type type = Type::PhaseChange;
@@ -132,6 +170,7 @@ struct MissionEvent
   double since_pass_s = 0.0;
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
   Gate setpoint;
+  SetpointSource source = SetpointSource::None;
 };
 
 std::string describe(const MissionEvent & event);
@@ -158,6 +197,9 @@ public:
   // A HOVER request from any phase: hold at the clamped pose with the hover policy.
   bool requestHold(double x, double y, double z, double yaw);
 
+  // A sent reference for the hover mission: where its hold starts, or the setpoint it moves to.
+  ReferenceUpdate updateHoldReference(double x, double y, double z, double yaw);
+
   // One policy step, exactly one act() of the active policy.
   StepResult step(const VehicleState & state, double t);
 
@@ -180,6 +222,9 @@ public:
 
   const GateSequencer & sequencer() const {return sequencer_;}
 
+  // The last sent reference the hover mission took, unclamped.
+  const std::optional<Gate> & sentReference() const {return sent_reference_;}
+
 private:
   static MissionConfig validated(MissionConfig config, const PolicyBank & policies);
 
@@ -189,7 +234,8 @@ private:
 
   void exitRace(ExitReason reason, const VehicleState & state, const GateUpdate & update);
 
-  void hold(const Gate & setpoint, ExitReason reason, MissionEvent event);
+  void hold(
+    const Gate & setpoint, SetpointSource source, ExitReason reason, MissionEvent event);
 
   MissionConfig config_;
   PolicyBank policies_;
@@ -201,6 +247,7 @@ private:
   Eigen::Vector3d previous_position_ = Eigen::Vector3d::Zero();
   bool has_previous_position_ = false;
   int outside_steps_ = 0;
+  std::optional<Gate> sent_reference_;
   std::vector<MissionEvent> events_;
 };
 

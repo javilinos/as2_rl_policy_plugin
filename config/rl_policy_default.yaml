@@ -11,11 +11,11 @@
       mission: race # race | hover
       policies:
         names: [race, hover] # race mission: race + hover; hover mission: hover
-        files: ["", ""] # exported quadlab_policy files, absolute paths
+        files: ["", ""] # exported quadlab_policy files; relative paths resolve against the directory the launch was started from
       vehicle:
         mass_kg: 1.131 # the platform's mass, which re-dimensionalizes the thrust
       motor_speed:
-        topic: sensor_measurements/motor_speed
+        topic: sensor_measurements/motor_angular_speed # sensor_msgs/JointState, velocity in rad/s in the policy's motor order
         timeout_s: 0.1
       course: # timed gates in pass order, world ENU, yaw in rad
         gates_x: [12.5, 6.5]
@@ -33,7 +33,8 @@
         ceiling_m: 10.0
         exit_debounce_steps: 3
       hold:
-        setpoint: [0.0, 0.0, 1.5, 0.0] # x, y, z, yaw; used by the hover mission and after_race: setpoint
+        setpoint: [0.0, 0.0, 1.5, 0.0] # x, y, z, yaw: the hover mission's hold while no reference is sent, and after_race: setpoint's
+        reference: sent_or_configured # sent_or_configured: the hover mission holds the last point of a sent trajectory reference, else setpoint | configured: setpoint
         min_altitude_m: 1.0
         after_race: here # here | setpoint: where the race's finish holds
       debug:

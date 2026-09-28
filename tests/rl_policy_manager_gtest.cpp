@@ -27,6 +27,7 @@
 #include "as2_msgs/msg/control_mode.hpp"
 #include "as2_msgs/msg/platform_info.hpp"
 #include "as2_msgs/msg/thrust.hpp"
+#include "as2_msgs/msg/trajectory_setpoints.hpp"
 #include "as2_msgs/srv/set_control_mode.hpp"
 #include "fixture_utils.hpp"
 
@@ -41,7 +42,8 @@ std::string scoped(const std::string & name)
   return std::string("/") + kNamespace + "/" + name;
 }
 
-std::shared_ptr<controller_manager::ControllerManager> makeManager()
+std::shared_ptr<controller_manager::ControllerManager> makeManager(
+  const std::vector<rclcpp::Parameter> & extra = {})
 {
   const YAML::Node course = rl_policy_test::loadFixture("obs_season2.yaml")["course"];
   const double dt = rl_policy_test::loadFixture(kPolicyFixture)["dt"].as<double>();
@@ -55,8 +57,7 @@ std::shared_ptr<controller_manager::ControllerManager> makeManager()
       ament_index_cpp::get_package_share_directory("as2_motion_controller") +
       "/config/motion_controller_default.yaml",
       "--params-file", config_dir + "/rl_policy_default.yaml"});
-  options.parameter_overrides(
-    {
+  std::vector<rclcpp::Parameter> overrides = {
       rclcpp::Parameter("plugin_name", std::string("rl_policy")),
       rclcpp::Parameter("use_bypass", false),
       rclcpp::Parameter(
@@ -69,17 +70,24 @@ std::shared_ptr<controller_manager::ControllerManager> makeManager()
       rclcpp::Parameter("rl_policy.course.gates_yaw", rl_policy_test::doubles(course["gates_yaw"])),
       // The drone does not move here: no gate may time the race out under the test.
       rclcpp::Parameter("rl_policy.race.gate_timeout_s", 600.0),
-    });
+  };
+  for (const rclcpp::Parameter & parameter : extra) {
+    overrides.push_back(parameter);
+  }
+  options.parameter_overrides(overrides);
   return std::make_shared<controller_manager::ControllerManager>(options);
 }
 
-// A static drone: its pose on TF, its twist, its rotor speeds and an armed, offboard platform.
+// A static drone: its pose on TF, its twist, its rotor speeds and an armed, offboard platform;
+// with a course, also a pilot that republishes it on the trajectory reference topic.
 class Drone
 {
 public:
-  Drone()
+  explicit Drone(
+    const as2_msgs::msg::TrajectorySetpoints & course = as2_msgs::msg::TrajectorySetpoints())
   : node_(std::make_shared<rclcpp::Node>(
-        "rl_policy_manager_drone", std::string("/") + kNamespace))
+        "rl_policy_manager_drone", std::string("/") + kNamespace)),
+    course_(course)
   {
     geometry_msgs::msg::TransformStamped transform;
     transform.header.stamp = node_->now();
@@ -98,7 +106,9 @@ public:
     info_pub_ = node_->create_publisher<as2_msgs::msg::PlatformInfo>(
       "platform/info", rclcpp::QoS(10));
     motor_pub_ = node_->create_publisher<sensor_msgs::msg::JointState>(
-      "sensor_measurements/motor_speed", rclcpp::SensorDataQoS());
+      "sensor_measurements/motor_angular_speed", rclcpp::SensorDataQoS());
+    course_pub_ = node_->create_publisher<as2_msgs::msg::TrajectorySetpoints>(
+      "motion_reference/trajectory", rclcpp::SensorDataQoS());
     thrust_sub_ = node_->create_subscription<as2_msgs::msg::Thrust>(
       "actuator_command/thrust", rclcpp::SensorDataQoS(),
       [this](const as2_msgs::msg::Thrust::SharedPtr msg) {
@@ -164,6 +174,11 @@ private:
     motors.header.stamp = twist.header.stamp;
     motors.velocity = {1400.0, 1400.0, 1400.0, 1400.0};
     motor_pub_->publish(motors);
+
+    if (!course_.setpoints.empty()) {
+      course_.header.stamp = twist.header.stamp;
+      course_pub_->publish(course_);
+    }
   }
 
   std::shared_ptr<rclcpp::Node> node_;
@@ -171,6 +186,8 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr twist_pub_;
   rclcpp::Publisher<as2_msgs::msg::PlatformInfo>::SharedPtr info_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr motor_pub_;
+  rclcpp::Publisher<as2_msgs::msg::TrajectorySetpoints>::SharedPtr course_pub_;
+  as2_msgs::msg::TrajectorySetpoints course_;
   rclcpp::Subscription<as2_msgs::msg::Thrust>::SharedPtr thrust_sub_;
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr status_sub_;
   rclcpp::Client<as2_msgs::srv::SetControlMode>::SharedPtr set_mode_client_;
@@ -250,6 +267,80 @@ TEST(PluginThroughTheManager, FliesOnTrajectoryThenHoldsOnHover) {
     EXPECT_EQ(drone.status("policy"), "hover");
     EXPECT_NEAR(std::stod(drone.status("setpoint_x")), 14.5, 1e-6);
     EXPECT_NEAR(std::stod(drone.status("setpoint_z")), 1.0, 1e-6);
+    const std::size_t before = drone.thrustCount();
+    EXPECT_TRUE(
+      waitFor(
+        [&drone, before]() {return drone.thrustCount() > before + 10;},
+        std::chrono::seconds(5)));
+  }
+
+  manager_executor.cancel();
+  platform_executor.cancel();
+  drone_executor.cancel();
+  manager_thread.join();
+  platform_thread.join();
+  drone_thread.join();
+}
+
+TEST(PluginThroughTheManager, TheHoverMissionHoldsTheLastPointOfTheSentCourse) {
+  std::string plugins;
+  ASSERT_TRUE(
+    ament_index_cpp::get_resource(
+      "as2_motion_controller__pluginlib__plugin", "as2_rl_policy", plugins))
+    << "as2_rl_policy is not in the ament index: build and install the package first";
+
+  const std::string policy = rl_policy_test::fixturePath(kPolicyFixture);
+  auto manager = makeManager(
+    {
+      rclcpp::Parameter("rl_policy.mission", std::string("hover")),
+      rclcpp::Parameter("rl_policy.policies.names", std::vector<std::string>{"hover"}),
+      rclcpp::Parameter("rl_policy.policies.files", std::vector<std::string>{policy}),
+    });
+  rclcpp::NodeOptions platform_options;
+  platform_options.arguments({"--ros-args", "-r", std::string("__ns:=/") + kNamespace});
+  auto platform = std::make_shared<as2_motion_controller_test::MockPlatform>(
+    std::vector<uint8_t>{0b00010000, 0b00100100},
+    as2_motion_controller_test::MockPlatform::ControlModeRequest(),
+    std::chrono::milliseconds(500), platform_options);
+
+  // As as2_race_pilot sends it: the vehicle, a gate, then the course's end point.
+  as2_msgs::msg::TrajectorySetpoints course;
+  course.header.frame_id = "earth";
+  for (const auto & values : std::vector<std::vector<double>>{
+      {14.5, 2.0, 0.2, 0.0}, {12.5, 2.0, 1.45, 3.14}, {10.0, 5.0, 1.8, 0.5}})
+  {
+    as2_msgs::msg::TrajectoryPoint point;
+    point.position.x = values[0];
+    point.position.y = values[1];
+    point.position.z = values[2];
+    point.yaw_angle = values[3];
+    course.setpoints.push_back(point);
+  }
+  Drone drone(course);
+
+  rclcpp::executors::SingleThreadedExecutor manager_executor;
+  rclcpp::executors::MultiThreadedExecutor platform_executor;
+  rclcpp::executors::SingleThreadedExecutor drone_executor;
+  manager_executor.add_node(manager);
+  platform_executor.add_node(platform);
+  drone_executor.add_node(drone.node());
+  std::thread manager_thread([&manager_executor]() {manager_executor.spin();});
+  std::thread platform_thread([&platform_executor]() {platform_executor.spin();});
+  std::thread drone_thread([&drone_executor]() {drone_executor.spin();});
+
+  const bool holding = waitFor(
+    [&drone]() {
+      return drone.status("phase") == "hold" && drone.status("setpoint_source") == "sent";
+    },
+    std::chrono::seconds(20));
+  EXPECT_TRUE(holding) << "no hold at the sent course's end point";
+  if (holding) {
+    EXPECT_EQ(drone.status("hold_reference"), "sent_or_configured");
+    EXPECT_EQ(drone.status("policy"), "hover");
+    EXPECT_NEAR(std::stod(drone.status("setpoint_x")), 10.0, 1e-6);
+    EXPECT_NEAR(std::stod(drone.status("setpoint_y")), 5.0, 1e-6);
+    EXPECT_NEAR(std::stod(drone.status("setpoint_z")), 1.8, 1e-6);
+    EXPECT_NEAR(std::stod(drone.status("setpoint_yaw")), 0.5, 1e-6);
     const std::size_t before = drone.thrustCount();
     EXPECT_TRUE(
       waitFor(

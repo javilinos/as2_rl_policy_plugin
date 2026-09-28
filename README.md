@@ -1,9 +1,10 @@
 # as2_rl_policy
 
 An Aerostack2 motion-controller plugin (`plugin_name: rl_policy`) that flies quadlab's exported
-rates policies: a race policy for N laps, then a hover policy that holds where the race ended.
-It takes TRAJECTORY (yaw angle) and gives BODY_RATES: collective thrust (N) and body rates
-(rad/s), one policy step per controller tick.
+rates policies: a race policy for N laps, then a hover policy that holds where the race ended
+(`mission: race`), or the hover policy alone at a setpoint (`mission: hover`). It takes
+TRAJECTORY (yaw angle) and gives BODY_RATES: collective thrust (N) and body rates (rad/s), one
+policy step per controller tick.
 
 - `as2_rl_policy_core`: the policy file loader (`quadlab_policy` v1, goldens checked on load),
   the gate-relative observation, the gate sequencer, the action decode and the mission
@@ -27,16 +28,66 @@ double and must be written with a decimal point. The plugin refuses to fly on a 
 mistyped key, a policy whose goldens do not reproduce, `cmd_freq` other than `1 / dt`, or
 pose/twist frames other than `/earth`, and says why at FATAL level.
 
+`policies.files` may be relative: the controller process resolves them against its working
+directory, which is the directory `ros2 launch` was started from, and logs the absolute path.
+
+The rotor speeds come from `motor_speed.topic`, a `sensor_msgs/JointState` with `velocity` in
+rad/s in the policy's motor order (RR, FR, RL, FL). The default is the aircraft's
+`sensor_measurements/motor_angular_speed` (as2_platform_indiflight); quadlab's generated file
+names the simulator's `sensor_measurements/motor_speed`.
+
 Debug topics: `debug/controller/rl_policy/status` (`diagnostic_msgs/DiagnosticStatus`) and
 `debug/controller/rl_policy/step` (`std_msgs/Float64MultiArray`, 61 columns labelled
-`rl_policy_step_v1`), under the drone namespace.
+`rl_policy_step_v1`), under the drone namespace. The status carries `hold_reference`,
+`setpoint_source` (`configured`, `sent`, `here` for a pose the vehicle was at, `none`) and
+`setpoint_x/y/z/yaw`, which the hover mission reports from Idle on: where its hold will start.
+
+## Hold reference
+
+The hover mission holds `hold.setpoint` until a reference is sent. With
+`hold.reference: sent_or_configured` (the default) the hold setpoint is the LAST point of the
+latest `as2_msgs/TrajectorySetpoints` on `motion_reference/trajectory`, its position and
+`yaw_angle`, clamped like `hold.setpoint` (x and y into the course bounds, z no lower than
+`hold.min_altitude_m`). A course sent before the pilot engages is where the hold starts; one
+sent during the hold moves the setpoint, and the hover policy carries on with its history. A
+republish of the same course (as2_race_pilot sends it every 100 ms) changes nothing. The frame
+must be `earth`, `/earth` or empty: other frames and non-finite points are ignored with a
+warning, empty courses are ignored, and the setpoint stays. A mode set keeps the reference.
+
+`hold.reference: configured` ignores sent references; so does the race mission, and a HOVER
+request holds where it was made. The controller manager passes references on only once a
+control mode is set, so the course has to arrive (or keep arriving) after `set_control_mode`.
 
 ## Run
+
+The launch file layers the node's parameters, each over the one before: as2_motion_controller's
+defaults, `config/rl_policy_default.yaml`, `plugin_config_file` (the `rl_policy` block), then
+`config_file` (a node file with a `controller_manager` block, or a whole flight under `/**`),
+then `plugin_name`, `use_bypass: false`, the available modes and `use_sim_time`. Either file
+may be left out, not both. `use_sim_time` is false unless given.
+
+On the aircraft only the safety pilot arms and switches to offboard, and the controller manager
+runs the plugin only while `platform/info` reports both: the pilot's offboard switch starts the
+mission.
+
+```bash
+ros2 launch as2_rl_policy rl_policy.launch.py namespace:=drone0 \
+    config_file:=config/config.yaml plugin_config_file:=config/rl_policy.yaml
+ros2 run as2_rl_policy engage.py --namespace drone0    # TRAJECTORY mode, then wait for the pilot
+```
+
+`engage.py` waits for the controller's service, sets TRAJECTORY (yaw angle) with retries, then
+waits for `platform/info` to report armed, then offboard, logs each and exits 0; `--timeout S`
+gives up after S seconds, and it never calls the arming or offboard services. as2_race_pilot
+does the same and sends its course besides, which the hover mission then holds at its end.
+
+In simulation, where the platform takes the arming and offboard services, `--arm` requests
+them after the mode:
 
 ```bash
 ros2 launch as2_rl_policy rl_policy.launch.py namespace:=drone0 use_sim_time:=true \
     config_file:=<params.yaml>
-ros2 run as2_rl_policy engage.py --namespace drone0    # TRAJECTORY mode, then arm and offboard
+ros2 run as2_rl_policy engage.py --namespace drone0 --arm
 ros2 service call /drone0/controller/set_control_mode as2_msgs/srv/SetControlMode \
     "{control_mode: {control_mode: 1, yaw_mode: 1}}"   # HOVER: hold where it is
 ```

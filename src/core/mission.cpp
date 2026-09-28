@@ -20,6 +20,11 @@ bool finite(const Gate & gate)
   return gate.position.allFinite() && std::isfinite(gate.yaw);
 }
 
+bool samePose(const Gate & a, const Gate & b)
+{
+  return a.position == b.position && a.yaw == b.yaw;
+}
+
 void require(bool condition, const std::string & message)
 {
   if (!condition) {
@@ -93,6 +98,32 @@ const char * toString(AfterRace after_race)
   return "unknown";
 }
 
+const char * toString(HoldReference reference)
+{
+  switch (reference) {
+    case HoldReference::SentOrConfigured:
+      return "sent_or_configured";
+    case HoldReference::Configured:
+      return "configured";
+  }
+  return "unknown";
+}
+
+const char * toString(SetpointSource source)
+{
+  switch (source) {
+    case SetpointSource::None:
+      return "none";
+    case SetpointSource::Configured:
+      return "configured";
+    case SetpointSource::Sent:
+      return "sent";
+    case SetpointSource::Here:
+      return "here";
+  }
+  return "unknown";
+}
+
 MissionType missionTypeFromString(const std::string & name)
 {
   if (name == toString(MissionType::Race)) {
@@ -115,6 +146,18 @@ AfterRace afterRaceFromString(const std::string & name)
   throw std::invalid_argument("after_race '" + name + "' is neither 'here' nor 'setpoint'");
 }
 
+HoldReference holdReferenceFromString(const std::string & name)
+{
+  if (name == toString(HoldReference::SentOrConfigured)) {
+    return HoldReference::SentOrConfigured;
+  }
+  if (name == toString(HoldReference::Configured)) {
+    return HoldReference::Configured;
+  }
+  throw std::invalid_argument(
+          "reference '" + name + "' is neither 'sent_or_configured' nor 'configured'");
+}
+
 std::string describe(const MissionEvent & event)
 {
   if (event.type == MissionEvent::Type::GatePassed) {
@@ -123,13 +166,20 @@ std::string describe(const MissionEvent & event)
       event.gate, event.crossing.lateral, event.crossing.vertical,
       event.valid ? "valid" : "outside the valid opening", event.gates_passed, event.lap);
   }
+  if (event.type == MissionEvent::Type::SetpointChange) {
+    return format(
+      "Sent reference: the hold %s [%.3f, %.3f, %.3f] yaw %.3f rad",
+      event.from == Phase::Hold ? "moves to" : "starts at", event.setpoint.position.x(),
+      event.setpoint.position.y(), event.setpoint.position.z(), event.setpoint.yaw);
+  }
   if (event.to == Phase::Race) {
     return format("Race started from gate %zu with policy '%s'", event.gate, event.policy.c_str());
   }
   std::string cause;
   switch (event.reason) {
     case ExitReason::None:
-      cause = "Holding the configured setpoint";
+      cause = event.source == SetpointSource::Sent ? "Holding the sent reference" :
+        "Holding the configured setpoint";
       break;
     case ExitReason::Finished:
       cause = format("Race finished: %d laps, %d gates", event.lap, event.gates_passed);
@@ -211,6 +261,12 @@ MissionController::MissionController(MissionConfig config, PolicyBank policies)
       config_.octagon_valid_half_m}),
   hold_course_(Course::single(config_.hold_setpoint))
 {
+  if (config_.type == MissionType::Hover) {
+    const Gate & setpoint = config_.hold_setpoint;
+    status_.setpoint = clampSetpoint(
+      setpoint.position.x(), setpoint.position.y(), setpoint.position.z(), setpoint.yaw);
+    status_.setpoint_source = SetpointSource::Configured;
+  }
 }
 
 bool MissionController::start()
@@ -219,11 +275,8 @@ bool MissionController::start()
     return false;
   }
   if (config_.type == MissionType::Hover) {
-    const Gate & setpoint = config_.hold_setpoint;
-    hold(
-      clampSetpoint(
-        setpoint.position.x(), setpoint.position.y(), setpoint.position.z(),
-        setpoint.yaw), ExitReason::None, MissionEvent());
+    const Gate setpoint = status_.setpoint;
+    hold(setpoint, status_.setpoint_source, ExitReason::None, MissionEvent());
     return true;
   }
 
@@ -255,8 +308,46 @@ bool MissionController::requestHold(double x, double y, double z, double yaw)
   }
   MissionEvent event;
   event.gate = sequencer_.target();
-  hold(clampSetpoint(x, y, z, yaw), ExitReason::HoverRequest, event);
+  hold(clampSetpoint(x, y, z, yaw), SetpointSource::Here, ExitReason::HoverRequest, event);
   return true;
+}
+
+ReferenceUpdate MissionController::updateHoldReference(double x, double y, double z, double yaw)
+{
+  if (config_.type != MissionType::Hover) {
+    return ReferenceUpdate::IgnoredRace;
+  }
+  if (config_.hold_reference == HoldReference::Configured) {
+    return ReferenceUpdate::IgnoredConfigured;
+  }
+  if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(yaw)) {
+    return ReferenceUpdate::NotFinite;
+  }
+  Gate reference;
+  reference.position = Eigen::Vector3d(x, y, z);
+  reference.yaw = yaw;
+  sent_reference_ = reference;
+  const Gate setpoint = clampSetpoint(x, y, z, yaw);
+  if (status_.setpoint_source == SetpointSource::Sent && samePose(setpoint, status_.setpoint)) {
+    return ReferenceUpdate::Unchanged;
+  }
+
+  status_.setpoint = setpoint;
+  status_.setpoint_source = SetpointSource::Sent;
+  const bool holding = status_.phase == Phase::Hold;
+  if (holding) {
+    hold_course_ = Course::single(setpoint);
+  }
+  MissionEvent event;
+  event.type = MissionEvent::Type::SetpointChange;
+  event.from = status_.phase;
+  event.to = status_.phase;
+  event.reason = status_.exit_reason;
+  event.policy = status_.policy;
+  event.setpoint = setpoint;
+  event.source = SetpointSource::Sent;
+  events_.push_back(event);
+  return holding ? ReferenceUpdate::Moved : ReferenceUpdate::Pending;
 }
 
 StepResult MissionController::step(const VehicleState & state, double t)
@@ -387,17 +478,19 @@ void MissionController::exitRace(
   const Gate pose = to_setpoint ? config_.hold_setpoint :
     Gate{state.position, yawFromQuaternion(state.orientation)};
   hold(
-    clampSetpoint(pose.position.x(), pose.position.y(), pose.position.z(), pose.yaw), reason,
-    event);
+    clampSetpoint(pose.position.x(), pose.position.y(), pose.position.z(), pose.yaw),
+    to_setpoint ? SetpointSource::Configured : SetpointSource::Here, reason, event);
 }
 
-void MissionController::hold(const Gate & setpoint, ExitReason reason, MissionEvent event)
+void MissionController::hold(
+  const Gate & setpoint, SetpointSource source, ExitReason reason, MissionEvent event)
 {
   event.type = MissionEvent::Type::PhaseChange;
   event.from = status_.phase;
   event.to = Phase::Hold;
   event.reason = reason;
   event.setpoint = setpoint;
+  event.source = source;
   event.lap = status_.lap;
   event.gates_passed = status_.gates_passed;
 
@@ -407,6 +500,7 @@ void MissionController::hold(const Gate & setpoint, ExitReason reason, MissionEv
   status_.exit_reason = reason;
   status_.holding = true;
   status_.setpoint = setpoint;
+  status_.setpoint_source = source;
   activate(kHoverPolicy);
 
   event.policy = status_.policy;

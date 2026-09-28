@@ -2,6 +2,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -19,6 +20,7 @@
 
 #include "as2_core/node.hpp"
 #include "as2_msgs/msg/control_mode.hpp"
+#include "as2_msgs/msg/trajectory_setpoints.hpp"
 #include "as2_rl_policy/rl_policy.hpp"
 #include "fixture_utils.hpp"
 
@@ -27,6 +29,7 @@ namespace
 
 using as2_msgs::msg::ControlMode;
 using rl_policy::Phase;
+using rl_policy::SetpointSource;
 
 constexpr char kNamespace[] = "test_rl_policy";
 constexpr char kPolicyFixture[] = "policy_random.yaml";
@@ -63,6 +66,42 @@ std::vector<rclcpp::Parameter> with(
   }
   parameters.push_back(parameter);
   return parameters;
+}
+
+// The hover mission with the fixture policy; the hold setpoint clamps to [1.0, 1.0, 1.5].
+std::vector<rclcpp::Parameter> hoverParameters()
+{
+  const std::string policy = rl_policy_test::fixturePath(kPolicyFixture);
+  auto parameters = flightParameters(policy);
+  parameters = with(parameters, rclcpp::Parameter("rl_policy.mission", std::string("hover")));
+  parameters = with(
+    parameters, rclcpp::Parameter("rl_policy.policies.names", std::vector<std::string>{"hover"}));
+  return with(
+    parameters,
+    rclcpp::Parameter("rl_policy.policies.files", std::vector<std::string>{policy}));
+}
+
+// A course as as2_race_pilot sends it: [x, y, z, yaw] per point, the end point last.
+as2_msgs::msg::TrajectorySetpoints course(
+  const std::string & frame_id, const std::vector<std::array<double, 4>> & points)
+{
+  as2_msgs::msg::TrajectorySetpoints msg;
+  msg.header.frame_id = frame_id;
+  for (const auto & values : points) {
+    as2_msgs::msg::TrajectoryPoint point;
+    point.position.x = values[0];
+    point.position.y = values[1];
+    point.position.z = values[2];
+    point.yaw_angle = values[3];
+    msg.setpoints.push_back(point);
+  }
+  return msg;
+}
+
+as2_msgs::msg::TrajectorySetpoints courseEndingAt(
+  const std::string & frame_id, double x, double y, double z, double yaw)
+{
+  return course(frame_id, {{14.5, 2.0, 0.2, 0.0}, {12.5, 2.0, 1.45, 3.14}, {x, y, z, yaw}});
 }
 
 ControlMode controlMode(int8_t control_mode, int8_t yaw_mode)
@@ -113,7 +152,7 @@ protected:
       "rl_policy_test_helper", std::string("/") + kNamespace);
     clock_pub_ = helper_->create_publisher<rosgraph_msgs::msg::Clock>("/clock", rclcpp::ClockQoS());
     motor_pub_ = helper_->create_publisher<sensor_msgs::msg::JointState>(
-      "sensor_measurements/motor_speed", rclcpp::SensorDataQoS());
+      "sensor_measurements/motor_angular_speed", rclcpp::SensorDataQoS());
     status_sub_ = helper_->create_subscription<diagnostic_msgs::msg::DiagnosticStatus>(
       std::string("/") + kNamespace + "/debug/controller/rl_policy/status", rclcpp::QoS(10),
       [this](const diagnostic_msgs::msg::DiagnosticStatus::SharedPtr msg) {
@@ -217,6 +256,16 @@ protected:
     return plugin_->computeOutput(0.0, pose_out_, twist_out_, thrust_out_);
   }
 
+  const rl_policy::MissionStatus & missionStatus() const {return plugin_->mission()->status();}
+
+  void expectSetpoint(double x, double y, double z, double yaw, SetpointSource source) const
+  {
+    const rl_policy::MissionStatus & status = missionStatus();
+    EXPECT_EQ(status.setpoint.position, Eigen::Vector3d(x, y, z));
+    EXPECT_DOUBLE_EQ(status.setpoint.yaw, yaw);
+    EXPECT_EQ(status.setpoint_source, source);
+  }
+
   // The status message the timer publishes once the node clock moves: the refusals, if any.
   std::string statusMessage()
   {
@@ -251,6 +300,11 @@ TEST_F(PluginTest, LoadsAndAcceptsItsModePairOnly) {
   EXPECT_EQ(plugin_->getDesiredPoseFrameId(), "earth");
   EXPECT_EQ(plugin_->getDesiredTwistFrameId(), "earth");
   EXPECT_EQ(plugin_->mission()->config().gates.size(), 12u);
+  EXPECT_EQ(
+    node_->get_parameter("rl_policy.motor_speed.topic").as_string(),
+    "sensor_measurements/motor_angular_speed");
+  EXPECT_EQ(
+    plugin_->mission()->config().hold_reference, rl_policy::HoldReference::SentOrConfigured);
 
   const ControlMode hover = plugin_->hoverMode();
   EXPECT_EQ(hover.control_mode, ControlMode::TRAJECTORY);
@@ -653,6 +707,212 @@ TEST_F(PluginTest, TrajectoryModeSetAfterAHoldIsANoOp) {
   ASSERT_TRUE(computeOutput());
   EXPECT_EQ(plugin_->mission()->phase(), Phase::Hold);
   EXPECT_EQ(plugin_->mission()->status().policy, "hover");
+}
+
+TEST_F(PluginTest, TheHoverMissionStartsAtAReferenceSentBeforeEngageThatSurvivesReset) {
+  build(hoverParameters());
+  ASSERT_TRUE(plugin_->isReady());
+  setTime(40.0);
+  ASSERT_TRUE(plugin_->setMode(kTrajectory, kBodyRates));
+  plugin_->reset();
+  plugin_->setHoverEnabled(false);
+  expectSetpoint(1.0, 1.0, 1.5, 0.0, SetpointSource::Configured);
+
+  plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  EXPECT_EQ(plugin_->mission()->phase(), Phase::Idle);
+  expectSetpoint(10.0, 5.0, 1.8, 0.5, SetpointSource::Sent);
+
+  // A mode set resets the plugin, never the reference it was sent.
+  ASSERT_TRUE(plugin_->setMode(kTrajectory, kBodyRates));
+  plugin_->reset();
+  plugin_->setHoverEnabled(false);
+  expectSetpoint(10.0, 5.0, 1.8, 0.5, SetpointSource::Sent);
+
+  plugin_->updateState(pose(14.5, 2.0, 0.2, 3.14), twist());
+  ASSERT_TRUE(firstStep());
+  EXPECT_EQ(plugin_->mission()->phase(), Phase::Hold);
+  EXPECT_EQ(missionStatus().exit_reason, rl_policy::ExitReason::None);
+  EXPECT_EQ(missionStatus().policy, "hover");
+  expectSetpoint(10.0, 5.0, 1.8, 0.5, SetpointSource::Sent);
+
+  statuses_.clear();
+  setTime(40.25);
+  spin(std::chrono::milliseconds(300));
+  ASSERT_FALSE(statuses_.empty());
+  auto status = values(statuses_.back());
+  EXPECT_EQ(status["phase"], "hold");
+  EXPECT_EQ(status["hold_reference"], "sent_or_configured");
+  EXPECT_EQ(status["setpoint_source"], "sent");
+  EXPECT_DOUBLE_EQ(std::stod(status["setpoint_x"]), 10.0);
+  EXPECT_DOUBLE_EQ(std::stod(status["setpoint_y"]), 5.0);
+  EXPECT_DOUBLE_EQ(std::stod(status["setpoint_z"]), 1.8);
+  EXPECT_DOUBLE_EQ(std::stod(status["setpoint_yaw"]), 0.5);
+}
+
+TEST_F(PluginTest, TheStatusReportsTheConfiguredSetpointBeforeEngage) {
+  build(hoverParameters());
+  ASSERT_TRUE(plugin_->isReady());
+  statuses_.clear();
+  setTime(1.0);
+  spin(std::chrono::milliseconds(300));
+  ASSERT_FALSE(statuses_.empty());
+  auto status = values(statuses_.back());
+  EXPECT_EQ(status["phase"], "idle");
+  EXPECT_EQ(status["setpoint_source"], "configured");
+  EXPECT_DOUBLE_EQ(std::stod(status["setpoint_x"]), 1.0);
+  EXPECT_DOUBLE_EQ(std::stod(status["setpoint_z"]), 1.5);
+  EXPECT_NE(statuses_.back().message.find("configured setpoint"), std::string::npos);
+
+  build(flightParameters(rl_policy_test::fixturePath(kPolicyFixture)));
+  statuses_.clear();
+  setTime(2.0);
+  spin(std::chrono::milliseconds(300));
+  ASSERT_FALSE(statuses_.empty());
+  status = values(statuses_.back());
+  EXPECT_EQ(status["setpoint_source"], "none");
+  EXPECT_TRUE(std::isnan(std::stod(status["setpoint_x"])));
+}
+
+TEST_F(PluginTest, AReferenceSentDuringTheHoldMovesItAndARepublishIsANoOp) {
+  build(hoverParameters());
+  ASSERT_TRUE(plugin_->isReady());
+  const double dt = policyDt();
+  setTime(60.0);
+  setTrajectoryMode(pose(14.5, 2.0, 0.2, 3.14));
+  ASSERT_TRUE(firstStep());
+  expectSetpoint(1.0, 1.0, 1.5, 0.0, SetpointSource::Configured);
+  setTime(60.0 + dt);
+  ASSERT_TRUE(computeOutput());
+  ASSERT_EQ(missionStatus().steps, 2u);
+  const rl_policy::ActionHistory history = plugin_->mission()->history();
+  ASSERT_EQ(history.size(), 2u);
+
+  plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  expectSetpoint(10.0, 5.0, 1.8, 0.5, SetpointSource::Sent);
+  EXPECT_EQ(plugin_->mission()->phase(), Phase::Hold);
+  EXPECT_EQ(missionStatus().policy, "hover");
+  EXPECT_EQ(missionStatus().steps, 2u);
+  EXPECT_EQ(plugin_->mission()->history()[0], history[0]);
+  EXPECT_EQ(plugin_->mission()->history()[1], history[1]);
+
+  // The pilot republishes its course every 100 ms: nothing moves, nothing is reported.
+  spin(std::chrono::milliseconds(100));
+  statuses_.clear();
+  for (int i = 0; i < 20; ++i) {
+    plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  }
+  spin(std::chrono::milliseconds(100));
+  EXPECT_TRUE(statuses_.empty());
+  expectSetpoint(10.0, 5.0, 1.8, 0.5, SetpointSource::Sent);
+  EXPECT_EQ(missionStatus().steps, 2u);
+  EXPECT_EQ(plugin_->mission()->history()[0], history[0]);
+  EXPECT_EQ(plugin_->mission()->history()[1], history[1]);
+
+  setTime(60.0 + 2.0 * dt);
+  ASSERT_TRUE(computeOutput());
+  EXPECT_EQ(missionStatus().steps, 3u);
+  spin(std::chrono::milliseconds(200));
+  ASSERT_FALSE(steps_.empty());
+  const std::vector<double> & step = steps_.back().data;
+  EXPECT_DOUBLE_EQ(step[4], 10.0);
+  EXPECT_DOUBLE_EQ(step[5], 5.0);
+  EXPECT_DOUBLE_EQ(step[6], 1.8);
+  EXPECT_DOUBLE_EQ(step[7], 0.5);
+  // The first act after the move sees the history it had, not a zeroed one.
+  EXPECT_DOUBLE_EQ(step[25 + 20], static_cast<double>(static_cast<float>(history[0][0])));
+
+  // A new course moves the hold again, clamped like the configured setpoint.
+  plugin_->updateReference(courseEndingAt("earth", 30.0, 0.0, 0.3, -1.0));
+  expectSetpoint(22.0, 1.0, 1.0, -1.0, SetpointSource::Sent);
+  EXPECT_EQ(missionStatus().exit_reason, rl_policy::ExitReason::None);
+}
+
+TEST_F(PluginTest, ReferencesInAnotherFrameOrWithoutPointsAreRefused) {
+  build(hoverParameters());
+  ASSERT_TRUE(plugin_->isReady());
+  setTrajectoryMode(pose(14.5, 2.0, 0.2, 3.14));
+  plugin_->updateReference(courseEndingAt("odom", 10.0, 5.0, 1.8, 0.5));
+  plugin_->updateReference(
+    courseEndingAt(std::string(kNamespace) + "/odom", 10.0, 5.0, 1.8, 0.5));
+  plugin_->updateReference(courseEndingAt("map", 10.0, 5.0, 1.8, 0.5));
+  expectSetpoint(1.0, 1.0, 1.5, 0.0, SetpointSource::Configured);
+
+  plugin_->updateReference(courseEndingAt("/earth", 10.0, 5.0, 1.8, 0.5));
+  expectSetpoint(10.0, 5.0, 1.8, 0.5, SetpointSource::Sent);
+  plugin_->updateReference(courseEndingAt("", 11.0, 6.0, 2.0, 0.25));
+  expectSetpoint(11.0, 6.0, 2.0, 0.25, SetpointSource::Sent);
+
+  plugin_->updateReference(courseEndingAt("odom", 12.0, 6.0, 2.0, 0.25));
+  plugin_->updateReference(course("earth", {}));
+  plugin_->updateReference(courseEndingAt("earth", std::nan(""), 6.0, 2.0, 0.25));
+  expectSetpoint(11.0, 6.0, 2.0, 0.25, SetpointSource::Sent);
+}
+
+TEST_F(PluginTest, AConfiguredHoldReferenceIgnoresSentReferences) {
+  const auto configured = [](const std::string & value) {
+      return with(hoverParameters(), rclcpp::Parameter("rl_policy.hold.reference", value));
+    };
+  build(configured("sent"));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(
+    statusMessage().find("'sent' is neither 'sent_or_configured' nor 'configured'"),
+    std::string::npos);
+
+  build(configured("configured"));
+  ASSERT_TRUE(plugin_->isReady());
+  EXPECT_EQ(plugin_->mission()->config().hold_reference, rl_policy::HoldReference::Configured);
+  setTime(70.0);
+  setTrajectoryMode(pose(14.5, 2.0, 0.2, 3.14));
+  plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  expectSetpoint(1.0, 1.0, 1.5, 0.0, SetpointSource::Configured);
+  ASSERT_TRUE(firstStep());
+  plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  expectSetpoint(1.0, 1.0, 1.5, 0.0, SetpointSource::Configured);
+  EXPECT_FALSE(plugin_->mission()->sentReference().has_value());
+}
+
+TEST_F(PluginTest, TheRaceMissionIgnoresSentReferences) {
+  build(flightParameters(rl_policy_test::fixturePath(kPolicyFixture)));
+  ASSERT_TRUE(plugin_->isReady());
+  setTime(80.0);
+  setTrajectoryMode(pose(14.5, 2.0, 0.2, 3.14));
+  plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  EXPECT_EQ(missionStatus().setpoint_source, SetpointSource::None);
+  ASSERT_TRUE(firstStep());
+  EXPECT_EQ(plugin_->mission()->phase(), Phase::Race);
+  plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  EXPECT_EQ(plugin_->mission()->phase(), Phase::Race);
+  EXPECT_EQ(missionStatus().target, 0);
+  EXPECT_FALSE(plugin_->mission()->sentReference().has_value());
+}
+
+TEST_F(PluginTest, AHoverRequestHoldsWhereItWasMadeWhateverTheReferences) {
+  build(hoverParameters());
+  ASSERT_TRUE(plugin_->isReady());
+  setTime(90.0);
+  setTrajectoryMode(pose(14.5, 2.0, 0.2, 3.14));
+  plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  ASSERT_TRUE(firstStep());
+  expectSetpoint(10.0, 5.0, 1.8, 0.5, SetpointSource::Sent);
+
+  // The handler: reset(), the hover flag, the frozen pose, then the same pose as a trajectory.
+  ASSERT_TRUE(plugin_->setMode(kTrajectory, kBodyRates));
+  plugin_->reset();
+  plugin_->setHoverEnabled(true);
+  plugin_->updateReference(pose(8.0, 4.0, 1.6, 0.3));
+  plugin_->updateReference(course("earth", {{8.0, 4.0, 1.6, 0.3}}));
+  plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  EXPECT_EQ(missionStatus().exit_reason, rl_policy::ExitReason::HoverRequest);
+  EXPECT_EQ(missionStatus().setpoint.position, Eigen::Vector3d(8.0, 4.0, 1.6));
+  EXPECT_EQ(missionStatus().setpoint_source, SetpointSource::Here);
+  ASSERT_TRUE(plugin_->mission()->sentReference().has_value());
+  EXPECT_EQ(plugin_->mission()->sentReference()->position, Eigen::Vector3d(10.0, 5.0, 1.8));
+
+  // Back in TRAJECTORY, the pilot's next republish is the hold again.
+  setTrajectoryMode(pose(8.0, 4.0, 1.6, 0.3));
+  plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
+  expectSetpoint(10.0, 5.0, 1.8, 0.5, SetpointSource::Sent);
+  EXPECT_EQ(plugin_->mission()->phase(), Phase::Hold);
 }
 
 int main(int argc, char ** argv)

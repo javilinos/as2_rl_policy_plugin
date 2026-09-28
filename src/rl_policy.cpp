@@ -4,7 +4,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <limits>
+#include <system_error>
 #include <utility>
 
 #include "as2_core/utils/control_mode_utils.hpp"
@@ -35,6 +37,14 @@ bool isOptionalInitParameter(const std::string & tail)
 {
   const std::vector<std::string> & tails = optionalInitParameters();
   return std::find(tails.begin(), tails.end(), tail) != tails.end();
+}
+
+// Relative to the working directory, where the policy loader resolves it.
+std::string absolutePath(const std::string & path)
+{
+  std::error_code error;
+  const std::filesystem::path absolute = std::filesystem::absolute(path, error);
+  return error ? path : absolute.string();
 }
 
 std::string text(double value)
@@ -91,6 +101,7 @@ std::vector<std::string> Plugin::initParameters() const
     "hold.setpoint",
     "hold.min_altitude_m",
     "hold.after_race",
+    "hold.reference",
   };
 }
 
@@ -319,6 +330,13 @@ void Plugin::readSettings(Settings & settings)
       refuse(param("hold.after_race") + ": " + e.what());
     }
   }
+  if (const auto * p = setting("hold.reference", ParameterType::PARAMETER_STRING)) {
+    try {
+      mission.hold_reference = holdReferenceFromString(p->as_string());
+    } catch (const std::invalid_argument & e) {
+      refuse(param("hold.reference") + ": " + e.what());
+    }
+  }
 }
 
 void Plugin::ownInitialize()
@@ -373,7 +391,8 @@ void Plugin::ownInitialize()
         const PolicySpec & spec = policy->spec();
         RCLCPP_INFO(
           logger, "Policy '%s' from %s: task %s, dt %.4f s, %d observations", name.c_str(),
-          spec.file.c_str(), spec.task.c_str(), spec.dt, spec.observation.dim);
+          absolutePath(spec.file).c_str(), spec.task.c_str(), spec.dt,
+          spec.observation.dim);
         RCLCPP_INFO(
           logger, "Policy '%s' checkpoint %s sha256 %s", name.c_str(),
           spec.source.checkpoint.c_str(), spec.source.checkpoint_sha256.c_str());
@@ -432,6 +451,14 @@ void Plugin::ownInitialize()
       "rl_policy ready: %s mission, %zu gates, %d laps, step %.4f s, motor speeds from '%s'",
       toString(config.type), config.gates.size(), config.laps, dt_,
       motor_speed_sub_->get_topic_name());
+    if (config.type == MissionType::Hover) {
+      const Gate & setpoint = mission_->status().setpoint;
+      RCLCPP_INFO(
+        logger, "The hover mission holds [%.3f, %.3f, %.3f] yaw %.3f rad (hold.setpoint)%s",
+        setpoint.position.x(), setpoint.position.y(), setpoint.position.z(), setpoint.yaw,
+        config.hold_reference == HoldReference::Configured ? "" :
+        ", or the last point of a sent trajectory reference");
+    }
   }
 
   if (info_freq > 0.0) {
@@ -551,10 +578,53 @@ void Plugin::onUpdateReference(const geometry_msgs::msg::TwistStamped & ref)
 
 void Plugin::onUpdateReference(const as2_msgs::msg::TrajectorySetpoints & ref)
 {
-  (void)ref;
-  RCLCPP_INFO_ONCE(
-    getNodePtr()->get_logger(),
-    "Trajectory references are ignored: the course comes from the configuration");
+  // A HOVER request holds where it was made, the handler's own frozen reference included.
+  if (!ready_ || isHoverEnabled()) {
+    return;
+  }
+  const rclcpp::Logger logger = getNodePtr()->get_logger();
+  const MissionConfig & config = mission_->config();
+  if (config.type == MissionType::Race) {
+    RCLCPP_INFO_ONCE(
+      logger, "Trajectory references are ignored: the race mission flies the configured course");
+    return;
+  }
+  if (config.hold_reference == HoldReference::Configured) {
+    RCLCPP_INFO_ONCE(
+      logger, "Trajectory references are ignored: hold.reference is configured");
+    return;
+  }
+  if (ref.setpoints.empty()) {
+    return;
+  }
+  auto & clock = *getNodePtr()->get_clock();
+  const std::string & frame = ref.header.frame_id;
+  const std::string bare = !frame.empty() && frame.front() == '/' ? frame.substr(1) : frame;
+  if (!frame.empty() && bare != getDesiredPoseFrameId()) {
+    RCLCPP_WARN_THROTTLE(
+      logger, clock, 5000,
+      "Trajectory reference in frame '%s', the hold is in '%s': ignored, the setpoint stays",
+      frame.c_str(), getDesiredPoseFrameId().c_str());
+    return;
+  }
+  const as2_msgs::msg::TrajectoryPoint & last = ref.setpoints.back();
+  switch (mission_->updateHoldReference(
+      last.position.x, last.position.y, last.position.z, last.yaw_angle))
+  {
+    case ReferenceUpdate::NotFinite:
+      RCLCPP_WARN_THROTTLE(
+        logger, clock, 5000,
+        "Trajectory reference with a non-finite last point: ignored, the setpoint stays");
+      break;
+    case ReferenceUpdate::Pending:
+    case ReferenceUpdate::Moved:
+      handleMissionEvents();
+      break;
+    case ReferenceUpdate::IgnoredRace:
+    case ReferenceUpdate::IgnoredConfigured:
+    case ReferenceUpdate::Unchanged:
+      break;
+  }
 }
 
 void Plugin::onUpdateReference(const as2_msgs::msg::Thrust & ref)
@@ -782,8 +852,14 @@ diagnostic_msgs::msg::DiagnosticStatus Plugin::statusMessage() const
       status.lap, config.laps, status.gates_passed);
   } else if (status.phase == Phase::Hold) {
     std::snprintf(
-      summary, sizeof(summary), "hold at [%.2f, %.2f, %.2f] (%s)", status.setpoint.position.x(),
-      status.setpoint.position.y(), status.setpoint.position.z(), toString(status.exit_reason));
+      summary, sizeof(summary), "hold at [%.2f, %.2f, %.2f] (%s, %s setpoint)",
+      status.setpoint.position.x(), status.setpoint.position.y(), status.setpoint.position.z(),
+      toString(status.exit_reason), toString(status.setpoint_source));
+  } else if (status.setpoint_source != SetpointSource::None) {
+    std::snprintf(
+      summary, sizeof(summary), "idle: the hold starts at [%.2f, %.2f, %.2f] (%s setpoint)",
+      status.setpoint.position.x(), status.setpoint.position.y(), status.setpoint.position.z(),
+      toString(status.setpoint_source));
   } else {
     std::snprintf(summary, sizeof(summary), "idle");
   }
@@ -813,9 +889,11 @@ diagnostic_msgs::msg::DiagnosticStatus Plugin::statusMessage() const
   msg.values.push_back(keyValue("valid_half_m", text(config.valid_half_m)));
   msg.values.push_back(keyValue("exit_reason", toString(status.exit_reason)));
   Gate setpoint{Eigen::Vector3d::Constant(nan), nan};
-  if (status.holding) {
+  if (status.setpoint_source != SetpointSource::None) {
     setpoint = status.setpoint;
   }
+  msg.values.push_back(keyValue("hold_reference", toString(config.hold_reference)));
+  msg.values.push_back(keyValue("setpoint_source", toString(status.setpoint_source)));
   msg.values.push_back(keyValue("setpoint_x", text(setpoint.position.x())));
   msg.values.push_back(keyValue("setpoint_y", text(setpoint.position.y())));
   msg.values.push_back(keyValue("setpoint_z", text(setpoint.position.z())));

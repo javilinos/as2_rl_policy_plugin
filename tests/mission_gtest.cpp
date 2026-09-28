@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -13,12 +14,15 @@ namespace
 using rl_policy::Action;
 using rl_policy::AfterRace;
 using rl_policy::ExitReason;
+using rl_policy::HoldReference;
 using rl_policy::MissionConfig;
 using rl_policy::MissionController;
 using rl_policy::MissionEvent;
 using rl_policy::MissionType;
 using rl_policy::Phase;
 using rl_policy::PolicyBank;
+using rl_policy::ReferenceUpdate;
+using rl_policy::SetpointSource;
 using rl_policy::StepResult;
 using rl_policy::VehicleState;
 
@@ -602,4 +606,218 @@ TEST_F(Mission, AfterRaceSetpointMustLieInsideTheBounds) {
   EXPECT_EQ(rl_policy::afterRaceFromString("setpoint"), AfterRace::Setpoint);
   EXPECT_THROW(rl_policy::afterRaceFromString("start"), std::invalid_argument);
   EXPECT_THROW(rl_policy::afterRaceFromString(""), std::invalid_argument);
+}
+
+TEST_F(Mission, TheHoverMissionReportsItsConfiguredSetpointBeforeItStarts) {
+  MissionConfig hover_config = config(MissionType::Hover);
+  hover_config.hold_setpoint.position = Eigen::Vector3d(40.0, -9.0, 0.2);
+  hover_config.hold_setpoint.yaw = 0.7;
+  MissionController mission(hover_config, bank(false, true));
+  EXPECT_EQ(mission.phase(), Phase::Idle);
+  EXPECT_FALSE(mission.status().holding);
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Configured);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(30.0, -5.0, 1.0));
+  EXPECT_FALSE(mission.sentReference().has_value());
+  ASSERT_TRUE(mission.start());
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Configured);
+  const auto events = mission.takeEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].source, SetpointSource::Configured);
+  EXPECT_EQ(rl_policy::describe(events[0]).rfind("Holding the configured setpoint", 0), 0u);
+
+  MissionController race(config(), bank());
+  EXPECT_EQ(race.status().setpoint_source, SetpointSource::None);
+}
+
+TEST_F(Mission, ASentReferenceBeforeTheStartIsWhereTheHoldStarts) {
+  MissionController mission(config(MissionType::Hover), bank(false, true));
+  EXPECT_EQ(mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::Pending);
+  EXPECT_EQ(mission.phase(), Phase::Idle);
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Sent);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(2.0, 1.0, 2.5));
+  EXPECT_DOUBLE_EQ(mission.status().setpoint.yaw, 0.4);
+  auto events = mission.takeEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].type, MissionEvent::Type::SetpointChange);
+  EXPECT_EQ(events[0].from, Phase::Idle);
+  EXPECT_EQ(
+    rl_policy::describe(events[0]),
+    "Sent reference: the hold starts at [2.000, 1.000, 2.500] yaw 0.400 rad");
+
+  ASSERT_TRUE(mission.start());
+  EXPECT_EQ(mission.phase(), Phase::Hold);
+  EXPECT_EQ(mission.status().exit_reason, ExitReason::None);
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Sent);
+  events = mission.takeEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].source, SetpointSource::Sent);
+  EXPECT_EQ(rl_policy::describe(events[0]).rfind("Holding the sent reference", 0), 0u);
+
+  const StepResult first = mission.step(at(0.0, 0.0, 0.0), 0.0);
+  EXPECT_EQ(first.frame.position, Eigen::Vector3d(2.0, 1.0, 2.5));
+  EXPECT_DOUBLE_EQ(first.frame.yaw, 0.4);
+  expectZeroHistory(first.observation);
+}
+
+TEST_F(Mission, ASentReferenceDuringTheHoldMovesTheSetpointAndKeepsTheHistory) {
+  MissionController mission(config(MissionType::Hover), bank(false, true));
+  ASSERT_TRUE(mission.start());
+  mission.step(at(0.0, 0.0, 1.5), 0.0);
+  mission.step(at(0.0, 0.0, 1.5), kDt);
+  mission.takeEvents();
+
+  EXPECT_EQ(mission.updateHoldReference(3.0, -2.0, 2.0, -0.6), ReferenceUpdate::Moved);
+  EXPECT_EQ(mission.phase(), Phase::Hold);
+  EXPECT_EQ(mission.status().policy, "hover");
+  EXPECT_EQ(mission.status().exit_reason, ExitReason::None);
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Sent);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(3.0, -2.0, 2.0));
+  const auto events = mission.takeEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].type, MissionEvent::Type::SetpointChange);
+  EXPECT_EQ(events[0].from, Phase::Hold);
+  EXPECT_EQ(
+    rl_policy::describe(events[0]),
+    "Sent reference: the hold moves to [3.000, -2.000, 2.000] yaw -0.600 rad");
+
+  const StepResult moved = mission.step(at(0.0, 0.0, 1.5), 2 * kDt);
+  EXPECT_EQ(moved.frame.position, Eigen::Vector3d(3.0, -2.0, 2.0));
+  EXPECT_DOUBLE_EQ(moved.frame.yaw, -0.6);
+  EXPECT_NEAR(moved.observation.head<3>().norm(), std::sqrt(13.25), 1e-5);
+  expectHistory(moved.observation, hover->actionAt(2), hover->actionAt(1));
+  EXPECT_EQ(moved.status.steps, 3u);
+  EXPECT_EQ(hover->calls(), 3u);
+}
+
+TEST_F(Mission, RepublishingTheSameReferenceIsANoOp) {
+  MissionController mission(config(MissionType::Hover), bank(false, true));
+  EXPECT_EQ(mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::Pending);
+  EXPECT_EQ(mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::Unchanged);
+  mission.takeEvents();
+  ASSERT_TRUE(mission.start());
+  mission.step(at(0.0, 0.0, 1.5), 0.0);
+  mission.step(at(0.0, 0.0, 1.5), kDt);
+  mission.takeEvents();
+
+  for (int i = 0; i < 10; ++i) {
+    EXPECT_EQ(mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::Unchanged);
+  }
+  EXPECT_TRUE(mission.takeEvents().empty());
+  EXPECT_EQ(mission.status().steps, 2u);
+  EXPECT_EQ(hover->calls(), 2u);
+  EXPECT_EQ(mission.history()[0], rl_policy::clip(hover->actionAt(2)));
+  EXPECT_EQ(mission.history()[1], rl_policy::clip(hover->actionAt(1)));
+  const StepResult next = mission.step(at(0.0, 0.0, 1.5), 2 * kDt);
+  EXPECT_EQ(next.frame.position, Eigen::Vector3d(2.0, 1.0, 2.5));
+  expectHistory(next.observation, hover->actionAt(2), hover->actionAt(1));
+}
+
+TEST_F(Mission, ASentReferenceIsClampedLikeTheConfiguredSetpoint) {
+  MissionController mission(config(MissionType::Hover), bank(false, true));
+  EXPECT_EQ(mission.updateHoldReference(40.0, -9.0, 0.2, 0.7), ReferenceUpdate::Pending);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(30.0, -5.0, 1.0));
+  EXPECT_DOUBLE_EQ(mission.status().setpoint.yaw, 0.7);
+  ASSERT_TRUE(mission.sentReference().has_value());
+  EXPECT_EQ(mission.sentReference()->position, Eigen::Vector3d(40.0, -9.0, 0.2));
+
+  ASSERT_TRUE(mission.start());
+  mission.takeEvents();
+  // Another reference that clamps to the same setpoint moves nothing.
+  EXPECT_EQ(mission.updateHoldReference(50.0, -7.0, 0.5, 0.7), ReferenceUpdate::Unchanged);
+  EXPECT_TRUE(mission.takeEvents().empty());
+  EXPECT_EQ(mission.sentReference()->position, Eigen::Vector3d(50.0, -7.0, 0.5));
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(30.0, -5.0, 1.0));
+}
+
+TEST_F(Mission, ANonFiniteReferenceIsRefused) {
+  MissionController mission(config(MissionType::Hover), bank(false, true));
+  EXPECT_EQ(
+    mission.updateHoldReference(std::nan(""), 1.0, 2.0, 0.0), ReferenceUpdate::NotFinite);
+  const double inf = std::numeric_limits<double>::infinity();
+  EXPECT_EQ(mission.updateHoldReference(1.0, 1.0, 2.0, inf), ReferenceUpdate::NotFinite);
+  EXPECT_FALSE(mission.sentReference().has_value());
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Configured);
+  EXPECT_TRUE(mission.takeEvents().empty());
+}
+
+TEST_F(Mission, AConfiguredHoldIgnoresSentReferences) {
+  MissionConfig configured = config(MissionType::Hover);
+  configured.hold_reference = HoldReference::Configured;
+  MissionController mission(configured, bank(false, true));
+  EXPECT_EQ(
+    mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::IgnoredConfigured);
+  EXPECT_FALSE(mission.sentReference().has_value());
+  ASSERT_TRUE(mission.start());
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Configured);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(0.0, 0.0, 1.5));
+  EXPECT_EQ(
+    mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::IgnoredConfigured);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(0.0, 0.0, 1.5));
+  EXPECT_EQ(MissionConfig().hold_reference, HoldReference::SentOrConfigured);
+}
+
+TEST_F(Mission, TheRaceMissionIgnoresSentReferences) {
+  MissionController mission(config(), bank());
+  EXPECT_EQ(mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::IgnoredRace);
+  ASSERT_TRUE(mission.start());
+  mission.step(at(0.0, 0.0, 1.5), 0.0);
+  EXPECT_EQ(mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::IgnoredRace);
+  EXPECT_EQ(mission.phase(), Phase::Race);
+  ASSERT_TRUE(mission.requestHold(1.0, 1.0, 2.0, 0.3));
+  mission.takeEvents();
+  EXPECT_EQ(mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::IgnoredRace);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(1.0, 1.0, 2.0));
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Here);
+  EXPECT_FALSE(mission.sentReference().has_value());
+  EXPECT_TRUE(mission.takeEvents().empty());
+}
+
+TEST_F(Mission, AHoverRequestHoldsHereUntilTheNextSentReference) {
+  MissionController mission(config(MissionType::Hover), bank(false, true));
+  EXPECT_EQ(mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::Pending);
+  ASSERT_TRUE(mission.start());
+  ASSERT_TRUE(mission.requestHold(5.0, 0.0, 1.2, 0.1));
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Here);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(5.0, 0.0, 1.2));
+  EXPECT_EQ(mission.sentReference()->position, Eigen::Vector3d(2.0, 1.0, 2.5));
+  EXPECT_EQ(mission.updateHoldReference(2.0, 1.0, 2.5, 0.4), ReferenceUpdate::Moved);
+  EXPECT_EQ(mission.status().setpoint_source, SetpointSource::Sent);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(2.0, 1.0, 2.5));
+}
+
+TEST_F(Mission, EveryHoldSaysWhereItsSetpointCameFrom) {
+  MissionController here(config(), bank());
+  here.start();
+  flyToTheLastGate(here, at(15.3, 0.2, 1.6, 0.2));
+  EXPECT_EQ(here.status().exit_reason, ExitReason::Finished);
+  EXPECT_EQ(here.status().setpoint_source, SetpointSource::Here);
+
+  MissionConfig to_setpoint = config();
+  to_setpoint.after_race = rl_policy::AfterRace::Setpoint;
+  MissionController configured(to_setpoint, bank());
+  configured.start();
+  flyToTheLastGate(configured, at(15.3, 0.2, 1.6, 0.2));
+  EXPECT_EQ(configured.status().setpoint_source, SetpointSource::Configured);
+
+  MissionController missed(to_setpoint, bank());
+  missed.start();
+  missed.step(at(4.8, 1.2, 1.5), 0.0);
+  missed.step(at(5.2, 1.2, 1.5), kDt);
+  EXPECT_EQ(missed.status().exit_reason, ExitReason::Missed);
+  EXPECT_EQ(missed.status().setpoint_source, SetpointSource::Here);
+
+  EXPECT_STREQ(rl_policy::toString(SetpointSource::None), "none");
+  EXPECT_STREQ(rl_policy::toString(SetpointSource::Configured), "configured");
+  EXPECT_STREQ(rl_policy::toString(SetpointSource::Sent), "sent");
+  EXPECT_STREQ(rl_policy::toString(SetpointSource::Here), "here");
+}
+
+TEST_F(Mission, HoldReferenceIsSentOrConfiguredOrConfigured) {
+  EXPECT_EQ(
+    rl_policy::holdReferenceFromString("sent_or_configured"), HoldReference::SentOrConfigured);
+  EXPECT_EQ(rl_policy::holdReferenceFromString("configured"), HoldReference::Configured);
+  EXPECT_THROW(rl_policy::holdReferenceFromString("sent"), std::invalid_argument);
+  EXPECT_THROW(rl_policy::holdReferenceFromString(""), std::invalid_argument);
+  EXPECT_STREQ(rl_policy::toString(HoldReference::SentOrConfigured), "sent_or_configured");
+  EXPECT_STREQ(rl_policy::toString(HoldReference::Configured), "configured");
 }
