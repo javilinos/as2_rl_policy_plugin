@@ -111,16 +111,29 @@ struct MissionConfig
   // Unset, the square's values.
   std::optional<double> octagon_pass_tolerance_m;
   std::optional<double> octagon_valid_half_m;
+  // Required when a gate is virtual.
+  std::optional<double> virtual_half_m;
   double gate_timeout_s = 0.0;
   double bounds_margin_m = 0.0;
   double ceiling_m = 0.0;
   int exit_debounce_steps = 0;
+  // Both zero, the room check reads the position alone.
+  double stop_latency_s = 0.0;
+  double stop_decel_ms2 = 0.0;
   Gate hold_setpoint;
   AfterRace after_race = AfterRace::Here;
   HoldReference hold_reference = HoldReference::SentOrConfigured;
   double min_altitude_m = 0.0;
   double mass_kg = 0.0;
+
+  // On when race.stop_latency_s or race.stop_decel_ms2 is positive.
+  bool stopCheck() const {return stop_latency_s > 0.0 || stop_decel_ms2 > 0.0;}
 };
+
+// p + v latency + v |v| / (2 decel), the last term left out when decel is zero.
+Eigen::Vector3d predictedStop(
+  const Eigen::Vector3d & position, const Eigen::Vector3d & velocity, double latency_s,
+  double decel_ms2);
 
 struct CrossingRecord
 {
@@ -146,6 +159,8 @@ struct MissionStatus
   Gate setpoint;
   SetpointSource setpoint_source = SetpointSource::None;
   std::uint64_t steps = 0;
+  // The last race step's predicted stop, with the stop check on.
+  std::optional<Eigen::Vector3d> predicted_stop;
 };
 
 struct MissionEvent
@@ -155,6 +170,7 @@ struct MissionEvent
     PhaseChange,
     GatePassed,
     SetpointChange,
+    GateOutside,
   };
 
   Type type = Type::PhaseChange;
@@ -169,6 +185,12 @@ struct MissionEvent
   bool valid = false;
   double since_pass_s = 0.0;
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
+  // GateOutside: the window the crossing missed.
+  double window_m = 0.0;
+  // OutOfBounds: which test was outside; the predicted stop only with the stop check on.
+  bool position_outside = false;
+  bool stop_outside = false;
+  std::optional<Eigen::Vector3d> predicted_stop;
   Gate setpoint;
   SetpointSource source = SetpointSource::None;
 };
@@ -232,7 +254,9 @@ private:
 
   void raceChecks(const VehicleState & state);
 
-  void exitRace(ExitReason reason, const VehicleState & state, const GateUpdate & update);
+  void exitRace(
+    ExitReason reason, const VehicleState & state, const GateUpdate & update,
+    MissionEvent event = MissionEvent());
 
   void hold(
     const Gate & setpoint, SetpointSource source, ExitReason reason, MissionEvent event);

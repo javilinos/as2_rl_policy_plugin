@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
+#include <map>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "as2_rl_policy/core/course.hpp"
@@ -18,6 +21,7 @@ using rl_policy::Course;
 using rl_policy::Gate;
 using rl_policy::GateEvent;
 using rl_policy::GateSequencer;
+using rl_policy::GateShape;
 
 Eigen::Vector3d vector3(const YAML::Node & node)
 {
@@ -49,6 +53,39 @@ Course seasonTwo()
   return Course(
     rl_policy_test::courseGates(
       rl_policy_test::loadFixture("obs_season2.yaml")["course"]));
+}
+
+// The virtual-gate fixture's course, every gate virtual.
+std::vector<Gate> virtualGates(const YAML::Node & fixture)
+{
+  std::vector<Gate> gates = rl_policy_test::courseGates(fixture["course"]);
+  for (Gate & gate : gates) {
+    gate.shape = GateShape::Virtual;
+  }
+  return gates;
+}
+
+rl_policy::SequencerConfig virtualConfig(int laps, double half)
+{
+  rl_policy::SequencerConfig config = sequencerConfig(laps);
+  config.virtual_half_m = half;
+  return config;
+}
+
+GateEvent eventNamed(const std::string & name)
+{
+  static const std::map<std::string, GateEvent> events = {
+    {"none", GateEvent::None}, {"passed", GateEvent::Passed},
+    {"finished", GateEvent::Finished}, {"outside", GateEvent::Outside}};
+  return events.at(name);
+}
+
+// A virtual gate at the origin facing +x, alone on its course.
+Course virtualAtTheOrigin()
+{
+  Gate gate;
+  gate.shape = GateShape::Virtual;
+  return Course(std::vector<Gate>{gate});
 }
 
 // Flies straight through the sequencer's target at the given offsets.
@@ -199,6 +236,9 @@ TEST(Crossing, OpeningNormOfEachShape) {
   const double t = std::sqrt(2.0) - 1.0;
   EXPECT_NEAR(rl_policy::openingNorm(GateShape::Octagon, 0.95, 0.95 * t), 0.95, 1e-12);
   EXPECT_NEAR(rl_policy::openingNorm(GateShape::Octagon, -0.95 * t, 0.95), 0.95, 1e-12);
+  // A virtual gate is judged as the kernel judges it, by the square's norm.
+  EXPECT_DOUBLE_EQ(rl_policy::openingNorm(GateShape::Virtual, 0.3, -0.5), 0.5);
+  EXPECT_DOUBLE_EQ(rl_policy::openingNorm(GateShape::Virtual, 0.49, -0.49), 0.49);
 }
 
 TEST(Sequencer, EverySquareIsJudgedOnItsWorseAxis) {
@@ -277,4 +317,177 @@ TEST(Sequencer, AnOctagonTakesTheSquareWindowsUnlessGivenItsOwn) {
   rl_policy::SequencerConfig negative = config;
   negative.octagon_valid_half_m = -0.6;
   EXPECT_THROW(GateSequencer(Course(gates), negative), std::invalid_argument);
+}
+
+TEST(VirtualGate, JudgedAsTheKernelJudgesTheFixture) {
+  const YAML::Node fixture = rl_policy_test::loadFixture("virtual_gates.yaml");
+  const double tolerance = fixture["tolerance"].as<double>();
+  const double half = fixture["virtual_half_m"].as<double>();
+  const std::vector<Gate> gates = virtualGates(fixture);
+  const YAML::Node cases = fixture["cases"];
+  ASSERT_GT(cases.size(), 0u);
+  int at_the_edge = 0;
+  int outside = 0;
+  for (std::size_t c = 0; c < cases.size(); ++c) {
+    const Gate & gate = gates.at(cases[c]["gate"].as<std::size_t>());
+    GateSequencer sequencer(Course(std::vector<Gate>{gate}), virtualConfig(1, half));
+    const rl_policy::GateUpdate update =
+      sequencer.update(vector3(cases[c]["prev"]), vector3(cases[c]["cur"]));
+    const bool crossed = cases[c]["crossed"].as<bool>();
+    const bool passed = cases[c]["passed"].as<bool>();
+    EXPECT_EQ(update.crossing.crossed, crossed) << "case " << c;
+    EXPECT_NEAR(update.crossing.lateral, cases[c]["lateral"].as<double>(), tolerance) << c;
+    EXPECT_NEAR(update.crossing.vertical, cases[c]["vertical"].as<double>(), tolerance) << c;
+    const GateEvent expected =
+      passed ? GateEvent::Finished : (crossed ? GateEvent::Outside : GateEvent::None);
+    EXPECT_EQ(update.event, expected) << "case " << c;
+    EXPECT_EQ(update.valid, passed) << "case " << c;
+    EXPECT_EQ(sequencer.gatesPassed(), passed ? 1 : 0) << "case " << c;
+    if (crossed) {
+      const double norm = rl_policy::openingNorm(
+        GateShape::Virtual, update.crossing.lateral, update.crossing.vertical);
+      EXPECT_NEAR(norm, cases[c]["norm"].as<double>(), tolerance) << "case " << c;
+      at_the_edge += cases[c]["norm"].as<double>() == half ? 1 : 0;
+      outside += passed ? 0 : 1;
+    }
+  }
+  EXPECT_GE(at_the_edge, 4);
+  EXPECT_GE(outside, 8);
+}
+
+TEST(VirtualGate, TheFixtureSequenceComesRoundAfterAnOutsideCrossing) {
+  const YAML::Node fixture = rl_policy_test::loadFixture("virtual_gates.yaml");
+  const double tolerance = fixture["tolerance"].as<double>();
+  const YAML::Node sequence = fixture["sequence"];
+  GateSequencer sequencer(
+    Course(virtualGates(fixture)),
+    virtualConfig(sequence["laps"].as<int>(), fixture["virtual_half_m"].as<double>()));
+  const YAML::Node positions = sequence["positions"];
+  const YAML::Node steps = sequence["steps"];
+  ASSERT_EQ(steps.size() + 1, positions.size());
+  int outside = 0;
+  for (std::size_t k = 0; k < steps.size(); ++k) {
+    const rl_policy::GateUpdate update =
+      sequencer.update(vector3(positions[k]), vector3(positions[k + 1]));
+    const GateEvent expected = eventNamed(steps[k]["event"].as<std::string>());
+    EXPECT_EQ(update.gate, steps[k]["gate"].as<std::size_t>()) << "step " << k;
+    EXPECT_EQ(update.event, expected) << "step " << k;
+    EXPECT_EQ(sequencer.target(), steps[k]["target"].as<std::size_t>()) << "step " << k;
+    EXPECT_EQ(sequencer.lap(), steps[k]["lap"].as<int>()) << "step " << k;
+    EXPECT_EQ(sequencer.gatesPassed(), steps[k]["gates_passed"].as<int>()) << "step " << k;
+    if (update.crossing.crossed) {
+      EXPECT_NEAR(update.crossing.lateral, steps[k]["lateral"].as<double>(), tolerance) << k;
+      EXPECT_NEAR(update.crossing.vertical, steps[k]["vertical"].as<double>(), tolerance) << k;
+    }
+    outside += expected == GateEvent::Outside ? 1 : 0;
+  }
+  EXPECT_GE(outside, 3);
+  EXPECT_TRUE(sequencer.finished());
+}
+
+TEST(VirtualGate, TheWindowIsStrictOnBothAxes) {
+  const auto through = [](double lateral, double vertical) {
+      GateSequencer sequencer(virtualAtTheOrigin(), virtualConfig(1, 0.5));
+      const Gate & gate = sequencer.course().gate(0);
+      return sequencer.update(
+        inGate(gate, -0.2, lateral, vertical), inGate(gate, 0.2, lateral, vertical)).event;
+    };
+  const double below = std::nextafter(0.5, 0.0);
+  EXPECT_EQ(through(below, 0.0), GateEvent::Finished);
+  EXPECT_EQ(through(0.5, 0.0), GateEvent::Outside);
+  EXPECT_EQ(through(-0.5, 0.0), GateEvent::Outside);
+  EXPECT_EQ(through(0.0, -below), GateEvent::Finished);
+  EXPECT_EQ(through(0.0, 0.5), GateEvent::Outside);
+  // The square's corner, which an octagon of the same apothem would cut off.
+  EXPECT_EQ(through(below, -below), GateEvent::Finished);
+  EXPECT_EQ(through(0.9, 0.0), GateEvent::Outside);
+}
+
+TEST(VirtualGate, AnOutsideCrossingNeitherAdvancesNorEndsTheRace) {
+  GateSequencer sequencer(virtualAtTheOrigin(), virtualConfig(2, 0.5));
+  const Gate & gate = sequencer.course().gate(0);
+  const rl_policy::GateUpdate wide =
+    sequencer.update(inGate(gate, -0.2, 0.7, 0.0), inGate(gate, 0.2, 0.7, 0.0));
+  EXPECT_EQ(wide.event, GateEvent::Outside);
+  EXPECT_TRUE(wide.crossing.crossed);
+  EXPECT_FALSE(wide.valid);
+  EXPECT_NEAR(wide.crossing.lateral, 0.7, 1e-12);
+  EXPECT_EQ(sequencer.target(), 0u);
+  EXPECT_EQ(sequencer.gatesPassed(), 0);
+  EXPECT_EQ(sequencer.stepsSincePass(), 1);
+  EXPECT_FALSE(sequencer.finished());
+
+  // Back behind the plane is no crossing; through the window again is the pass.
+  EXPECT_EQ(
+    sequencer.update(inGate(gate, 0.2, 0.7, 0.0), inGate(gate, -0.2, 0.1, 0.0)).event,
+    GateEvent::None);
+  const rl_policy::GateUpdate pass =
+    sequencer.update(inGate(gate, -0.2, 0.1, 0.0), inGate(gate, 0.2, 0.1, 0.0));
+  EXPECT_EQ(pass.event, GateEvent::Passed);
+  EXPECT_TRUE(pass.valid);
+  EXPECT_EQ(sequencer.gatesPassed(), 1);
+  EXPECT_EQ(sequencer.lap(), 1);
+  EXPECT_EQ(sequencer.stepsSincePass(), 0);
+}
+
+TEST(VirtualGate, TheTimeoutStillApplies) {
+  const rl_policy::SequencerConfig config = virtualConfig(1, 0.5);
+  GateSequencer sequencer(virtualAtTheOrigin(), config);
+  const Gate & gate = sequencer.course().gate(0);
+  const Eigen::Vector3d behind = inGate(gate, -0.2, 0.7, 0.0);
+  const Eigen::Vector3d beyond = inGate(gate, 0.2, 0.7, 0.0);
+  int updates = 0;
+  rl_policy::GateUpdate update;
+  do {
+    // Through the plane outside the window and back, over and over.
+    const bool forward = updates % 2 == 0;
+    update = sequencer.update(forward ? behind : beyond, forward ? beyond : behind);
+    ++updates;
+  } while ((update.event == GateEvent::None || update.event == GateEvent::Outside) &&
+  updates < 100000);
+  EXPECT_EQ(update.event, GateEvent::Timeout);
+  EXPECT_EQ(sequencer.gatesPassed(), 0);
+  EXPECT_GT(updates * config.dt, config.gate_timeout_s);
+  EXPECT_LE((updates - 1) * config.dt, config.gate_timeout_s);
+}
+
+TEST(VirtualGate, SquaresAndOctagonsBesideItKeepTheirRules) {
+  std::vector<Gate> gates(3);
+  for (int i = 0; i < 3; ++i) {
+    gates[i].position = Eigen::Vector3d(5.0 * (i + 1), 0.0, 1.5);
+  }
+  gates[1].shape = GateShape::Virtual;
+  gates[2].shape = GateShape::Octagon;
+  // A virtual window narrower than the square's tolerance: each gate by its own.
+  const rl_policy::SequencerConfig config = virtualConfig(1, 0.3);
+  EXPECT_DOUBLE_EQ(config.passTolerance(GateShape::Virtual), 0.3);
+  EXPECT_DOUBLE_EQ(config.validHalf(GateShape::Virtual), 0.3);
+  EXPECT_DOUBLE_EQ(config.passTolerance(GateShape::Square), 0.9);
+
+  GateSequencer missed(Course(gates), config);
+  EXPECT_EQ(passTarget(missed, 0.95, 0.0).event, GateEvent::Missed);
+
+  GateSequencer sequencer(Course(gates), config);
+  EXPECT_EQ(passTarget(sequencer, 0.5, 0.0).event, GateEvent::Passed);
+  EXPECT_EQ(passTarget(sequencer, 0.5, 0.0).event, GateEvent::Outside);
+  EXPECT_EQ(sequencer.target(), 1u);
+  EXPECT_EQ(passTarget(sequencer, 0.29, -0.29).event, GateEvent::Passed);
+  EXPECT_EQ(passTarget(sequencer, 0.7, 0.6).event, GateEvent::Missed);
+  EXPECT_EQ(sequencer.target(), 2u);
+}
+
+TEST(VirtualGate, ACourseWithOneNeedsItsWindow) {
+  GateSequencer square_only(seasonTwo(), sequencerConfig(1));
+  EXPECT_FALSE(square_only.config().virtual_half_m.has_value());
+  EXPECT_EQ(rl_policy::countShape(square_only.course(), GateShape::Virtual), 0u);
+  EXPECT_THROW(GateSequencer(virtualAtTheOrigin(), sequencerConfig(1)), std::invalid_argument);
+  for (const double bad : {0.0, -0.5, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()})
+  {
+    EXPECT_THROW(GateSequencer(virtualAtTheOrigin(), virtualConfig(1, bad)), std::invalid_argument)
+      << bad;
+    EXPECT_THROW(GateSequencer(seasonTwo(), virtualConfig(1, bad)), std::invalid_argument) << bad;
+  }
+  EXPECT_NO_THROW(GateSequencer(seasonTwo(), virtualConfig(1, 0.5)));
+  EXPECT_STREQ(rl_policy::toString(GateShape::Virtual), "virtual");
 }

@@ -23,8 +23,13 @@ struct Crossing
 Crossing planeCrossing(
   const Eigen::Vector3d & previous, const Eigen::Vector3d & current, const Gate & gate);
 
-// max(|lateral|, |vertical|); an octagon's norm also takes (|lateral| + |vertical|) / sqrt(2).
+// max(|lateral|, |vertical|), a virtual gate's too; an octagon's also takes (|u| + |v|) / sqrt(2).
 double openingNorm(GateShape shape, double lateral, double vertical);
+
+const char * toString(GateShape shape);
+
+// How many of the course's gates have this shape.
+std::size_t countShape(const Course & course, GateShape shape);
 
 struct SequencerConfig
 {
@@ -36,6 +41,8 @@ struct SequencerConfig
   // Unset, an octagon is held to the square's tolerance and window, in its own norm.
   std::optional<double> octagon_pass_tolerance_m;
   std::optional<double> octagon_valid_half_m;
+  // A virtual gate's pass and valid window both; required once the course has a virtual gate.
+  std::optional<double> virtual_half_m;
 
   double passTolerance(GateShape shape) const;
 
@@ -49,6 +56,8 @@ enum class GateEvent
   Finished,
   Missed,
   Timeout,
+  // A virtual gate's plane crossed at or outside its window: no pass, no miss, the target stays.
+  Outside,
 };
 
 struct GateUpdate

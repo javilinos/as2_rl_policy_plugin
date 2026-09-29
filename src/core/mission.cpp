@@ -166,6 +166,12 @@ std::string describe(const MissionEvent & event)
       event.gate, event.crossing.lateral, event.crossing.vertical,
       event.valid ? "valid" : "outside the valid opening", event.gates_passed, event.lap);
   }
+  if (event.type == MissionEvent::Type::GateOutside) {
+    return format(
+      "Gate %zu crossed outside its virtual window: lateral %.3f m, vertical %.3f m, not "
+      "inside %.3f m; no pass, gate %zu stays the target", event.gate, event.crossing.lateral,
+      event.crossing.vertical, event.window_m, event.gate);
+  }
   if (event.type == MissionEvent::Type::SetpointChange) {
     return format(
       "Sent reference: the hold %s [%.3f, %.3f, %.3f] yaw %.3f rad",
@@ -193,9 +199,19 @@ std::string describe(const MissionEvent & event)
       cause = format("Gate %zu not passed in %.2f s", event.gate, event.since_pass_s);
       break;
     case ExitReason::OutOfBounds:
+      if (!event.predicted_stop) {
+        cause = format(
+          "Out of bounds at [%.2f, %.2f, %.2f]", event.position.x(), event.position.y(),
+          event.position.z());
+        break;
+      }
       cause = format(
-        "Out of bounds at [%.2f, %.2f, %.2f]", event.position.x(), event.position.y(),
-        event.position.z());
+        "Out of bounds: %s outside, position [%.2f, %.2f, %.2f], predicted stop "
+        "[%.2f, %.2f, %.2f]",
+        event.position_outside ?
+        (event.stop_outside ? "the position and the predicted stop are" : "the position is") :
+        "the predicted stop is", event.position.x(), event.position.y(), event.position.z(),
+        event.predicted_stop->x(), event.predicted_stop->y(), event.predicted_stop->z());
       break;
     case ExitReason::HoverRequest:
       cause = "HOVER request";
@@ -206,6 +222,17 @@ std::string describe(const MissionEvent & event)
     toString(event.from), toString(event.to), event.setpoint.position.x(),
     event.setpoint.position.y(), event.setpoint.position.z(), event.setpoint.yaw,
     event.policy.c_str());
+}
+
+Eigen::Vector3d predictedStop(
+  const Eigen::Vector3d & position, const Eigen::Vector3d & velocity, double latency_s,
+  double decel_ms2)
+{
+  Eigen::Vector3d stop = position + velocity * latency_s;
+  if (decel_ms2 > 0.0) {
+    stop += velocity * velocity.norm() / (2.0 * decel_ms2);
+  }
+  return stop;
 }
 
 MissionConfig MissionController::validated(MissionConfig config, const PolicyBank & policies)
@@ -235,10 +262,27 @@ MissionConfig MissionController::validated(MissionConfig config, const PolicyBan
   require(
     !config.octagon_valid_half_m || *config.octagon_valid_half_m > 0.0,
     "race.octagon_valid_half_m must be positive");
+  require(
+    !config.virtual_half_m ||
+    (std::isfinite(*config.virtual_half_m) && *config.virtual_half_m > 0.0),
+    "race.virtual_half_m must be finite and positive");
+  const bool virtual_gates = std::any_of(
+    config.gates.begin(), config.gates.end(),
+    [](const Gate & gate) {return gate.shape == GateShape::Virtual;});
+  require(
+    !virtual_gates || config.virtual_half_m.has_value(),
+    "the course has virtual gates (course.gates_shape 2) and race.virtual_half_m, their "
+    "window, is not set");
   require(config.gate_timeout_s > 0.0, "race.gate_timeout_s must be positive");
   require(config.bounds_margin_m >= 0.0, "race.bounds_margin_m must not be negative");
   require(std::isfinite(config.ceiling_m), "race.ceiling_m must be finite");
   require(config.exit_debounce_steps >= 1, "race.exit_debounce_steps must be at least 1");
+  require(
+    std::isfinite(config.stop_latency_s) && config.stop_latency_s >= 0.0,
+    "race.stop_latency_s must be finite and not negative");
+  require(
+    std::isfinite(config.stop_decel_ms2) && config.stop_decel_ms2 >= 0.0,
+    "race.stop_decel_ms2 must be finite and not negative");
   require(finite(config.hold_setpoint), "hold.setpoint must be finite");
   if (config.type == MissionType::Race && config.after_race == AfterRace::Setpoint) {
     require(
@@ -258,7 +302,7 @@ MissionController::MissionController(MissionConfig config, PolicyBank policies)
     Course(config_.gates, config_.bounds),
     SequencerConfig{config_.laps, config_.pass_tolerance_m, config_.valid_half_m,
       config_.gate_timeout_s, policies_.dt(), config_.octagon_pass_tolerance_m,
-      config_.octagon_valid_half_m}),
+      config_.octagon_valid_half_m, config_.virtual_half_m}),
   hold_course_(Course::single(config_.hold_setpoint))
 {
   if (config_.type == MissionType::Hover) {
@@ -289,6 +333,7 @@ bool MissionController::start()
   status_.gates_passed = 0;
   status_.exit_reason = ExitReason::None;
   status_.holding = false;
+  status_.predicted_stop.reset();
   activate(kRacePolicy);
 
   MissionEvent event;
@@ -431,6 +476,20 @@ void MissionController::raceChecks(const VehicleState & state)
       event.crossing = update.crossing;
       event.valid = update.valid;
       events_.push_back(event);
+    } else if (update.crossing.crossed && update.event != GateEvent::Missed) {
+      // Only a virtual gate's plane is crossed without a pass or a miss.
+      MissionEvent event;
+      event.type = MissionEvent::Type::GateOutside;
+      event.from = Phase::Race;
+      event.to = Phase::Race;
+      event.policy = status_.policy;
+      event.gate = update.gate;
+      event.lap = status_.lap;
+      event.gates_passed = status_.gates_passed;
+      event.crossing = update.crossing;
+      event.window_m =
+        sequencer_.config().passTolerance(sequencer_.course().gate(update.gate).shape);
+      events_.push_back(event);
     }
     switch (update.event) {
       case GateEvent::Finished:
@@ -444,6 +503,7 @@ void MissionController::raceChecks(const VehicleState & state)
         break;
       case GateEvent::None:
       case GateEvent::Passed:
+      case GateEvent::Outside:
         break;
     }
   }
@@ -453,21 +513,32 @@ void MissionController::raceChecks(const VehicleState & state)
     return;
   }
 
-  const bool outside =
-    !config_.bounds.contains(current.x(), current.y(), config_.bounds_margin_m) ||
-    current.z() > config_.ceiling_m;
-  outside_steps_ = outside ? outside_steps_ + 1 : 0;
+  const auto outside_room = [this](const Eigen::Vector3d & point) {
+      return !config_.bounds.contains(point.x(), point.y(), config_.bounds_margin_m) ||
+             point.z() > config_.ceiling_m;
+    };
+  const bool position_outside = outside_room(current);
+  bool stop_outside = false;
+  if (config_.stopCheck()) {
+    status_.predicted_stop = predictedStop(
+      current, state.velocity, config_.stop_latency_s, config_.stop_decel_ms2);
+    stop_outside = outside_room(*status_.predicted_stop);
+  }
+  outside_steps_ = position_outside || stop_outside ? outside_steps_ + 1 : 0;
   if (outside_steps_ >= config_.exit_debounce_steps) {
     GateUpdate update;
     update.gate = sequencer_.target();
-    exitRace(ExitReason::OutOfBounds, state, update);
+    MissionEvent event;
+    event.position_outside = position_outside;
+    event.stop_outside = stop_outside;
+    event.predicted_stop = status_.predicted_stop;
+    exitRace(ExitReason::OutOfBounds, state, update, event);
   }
 }
 
 void MissionController::exitRace(
-  ExitReason reason, const VehicleState & state, const GateUpdate & update)
+  ExitReason reason, const VehicleState & state, const GateUpdate & update, MissionEvent event)
 {
-  MissionEvent event;
   event.gate = update.gate;
   event.crossing = update.crossing;
   event.valid = update.valid;

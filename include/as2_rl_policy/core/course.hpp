@@ -10,11 +10,12 @@
 namespace rl_policy
 {
 
-// An octagon has its flats on the gate's lateral and vertical axes.
+// An octagon has its flats on the gate's lateral and vertical axes; a virtual gate has no frame.
 enum class GateShape
 {
   Square = 0,
   Octagon = 1,
+  Virtual = 2,
 };
 
 struct Gate

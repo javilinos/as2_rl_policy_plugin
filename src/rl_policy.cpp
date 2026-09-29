@@ -29,6 +29,9 @@ const std::vector<std::string> & optionalInitParameters()
     "course.gates_shape",
     "race.octagon_pass_tolerance_m",
     "race.octagon_valid_half_m",
+    "race.virtual_half_m",
+    "race.stop_latency_s",
+    "race.stop_decel_ms2",
   };
   return tails;
 }
@@ -252,10 +255,12 @@ void Plugin::readSettings(Settings & settings)
         mission.gates[i].shape = GateShape::Square;
       } else if (values[i] == static_cast<int64_t>(GateShape::Octagon)) {
         mission.gates[i].shape = GateShape::Octagon;
+      } else if (values[i] == static_cast<int64_t>(GateShape::Virtual)) {
+        mission.gates[i].shape = GateShape::Virtual;
       } else {
         refuse(
           param("course.gates_shape") + " entry " + std::to_string(i) + " is " +
-          std::to_string(values[i]) + ": 0 is a square, 1 an octagon");
+          std::to_string(values[i]) + ": 0 is a square, 1 an octagon, 2 a virtual gate");
       }
     }
   }
@@ -297,6 +302,15 @@ void Plugin::readSettings(Settings & settings)
     optionalSetting("race.octagon_valid_half_m", ParameterType::PARAMETER_DOUBLE))
   {
     mission.octagon_valid_half_m = p->as_double();
+  }
+  if (const auto * p = optionalSetting("race.virtual_half_m", ParameterType::PARAMETER_DOUBLE)) {
+    mission.virtual_half_m = p->as_double();
+  }
+  if (const auto * p = optionalSetting("race.stop_latency_s", ParameterType::PARAMETER_DOUBLE)) {
+    mission.stop_latency_s = p->as_double();
+  }
+  if (const auto * p = optionalSetting("race.stop_decel_ms2", ParameterType::PARAMETER_DOUBLE)) {
+    mission.stop_decel_ms2 = p->as_double();
   }
   if (const auto * p = setting("race.gate_timeout_s", ParameterType::PARAMETER_DOUBLE)) {
     mission.gate_timeout_s = p->as_double();
@@ -451,6 +465,29 @@ void Plugin::ownInitialize()
       "rl_policy ready: %s mission, %zu gates, %d laps, step %.4f s, motor speeds from '%s'",
       toString(config.type), config.gates.size(), config.laps, dt_,
       motor_speed_sub_->get_topic_name());
+    const std::size_t virtual_gates =
+      countShape(mission_->sequencer().course(), GateShape::Virtual);
+    if (config.type == MissionType::Race && virtual_gates > 0) {
+      RCLCPP_INFO(
+        logger,
+        "%zu virtual gates: a crossing passes inside max(|u|, |v|) < %.3f m "
+        "(race.virtual_half_m), one outside is no pass and no miss", virtual_gates,
+        *config.virtual_half_m);
+    }
+    if (config.type == MissionType::Race && config.stopCheck()) {
+      char stop[96];
+      if (config.stop_decel_ms2 > 0.0) {
+        std::snprintf(
+          stop, sizeof(stop), "p + v * %.3f s + v |v| / (2 * %.3f m/s^2)", config.stop_latency_s,
+          config.stop_decel_ms2);
+      } else {
+        std::snprintf(stop, sizeof(stop), "p + v * %.3f s", config.stop_latency_s);
+      }
+      RCLCPP_INFO(
+        logger,
+        "Stop check on: the race also exits when its predicted stop %s leaves the bounds or "
+        "the ceiling (race.stop_latency_s, race.stop_decel_ms2)", stop);
+    }
     if (config.type == MissionType::Hover) {
       const Gate & setpoint = mission_->status().setpoint;
       RCLCPP_INFO(
@@ -888,6 +925,12 @@ diagnostic_msgs::msg::DiagnosticStatus Plugin::statusMessage() const
   msg.values.push_back(keyValue("last_crossing_valid", text(crossing.valid)));
   msg.values.push_back(keyValue("valid_half_m", text(config.valid_half_m)));
   msg.values.push_back(keyValue("exit_reason", toString(status.exit_reason)));
+  if (config.stopCheck()) {
+    const Eigen::Vector3d stop = status.predicted_stop.value_or(Eigen::Vector3d::Constant(nan));
+    msg.values.push_back(keyValue("predicted_stop_x", text(stop.x())));
+    msg.values.push_back(keyValue("predicted_stop_y", text(stop.y())));
+    msg.values.push_back(keyValue("predicted_stop_z", text(stop.z())));
+  }
   Gate setpoint{Eigen::Vector3d::Constant(nan), nan};
   if (status.setpoint_source != SetpointSource::None) {
     setpoint = status.setpoint;

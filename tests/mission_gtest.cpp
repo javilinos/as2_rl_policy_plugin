@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <yaml-cpp/yaml.h>
+
 #include <cmath>
 #include <limits>
 #include <memory>
@@ -7,6 +9,7 @@
 #include <vector>
 
 #include "as2_rl_policy/core/mission.hpp"
+#include "fixture_utils.hpp"
 
 namespace
 {
@@ -14,6 +17,7 @@ namespace
 using rl_policy::Action;
 using rl_policy::AfterRace;
 using rl_policy::ExitReason;
+using rl_policy::GateShape;
 using rl_policy::HoldReference;
 using rl_policy::MissionConfig;
 using rl_policy::MissionController;
@@ -76,6 +80,24 @@ VehicleState at(double x, double y, double z, double yaw = 0.0)
   state.orientation = Eigen::Quaterniond(Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()));
   state.motor_speeds = {1500.0, 1500.0, 1500.0, 1500.0};
   return state;
+}
+
+VehicleState moving(double x, double y, double z, double vx, double vy, double vz)
+{
+  VehicleState state = at(x, y, z);
+  state.velocity = Eigen::Vector3d(vx, vy, vz);
+  return state;
+}
+
+std::vector<MissionEvent> ofType(const std::vector<MissionEvent> & events, MissionEvent::Type type)
+{
+  std::vector<MissionEvent> out;
+  for (const MissionEvent & event : events) {
+    if (event.type == type) {
+      out.push_back(event);
+    }
+  }
+  return out;
 }
 
 double f32(double value)
@@ -820,4 +842,289 @@ TEST_F(Mission, HoldReferenceIsSentOrConfiguredOrConfigured) {
   EXPECT_THROW(rl_policy::holdReferenceFromString(""), std::invalid_argument);
   EXPECT_STREQ(rl_policy::toString(HoldReference::SentOrConfigured), "sent_or_configured");
   EXPECT_STREQ(rl_policy::toString(HoldReference::Configured), "configured");
+}
+
+TEST_F(Mission, AVirtualGateCrossedOutsideItsWindowIsNoPassAndNoMiss) {
+  MissionConfig virtuals = config();
+  for (rl_policy::Gate & gate : virtuals.gates) {
+    gate.shape = GateShape::Virtual;
+  }
+  virtuals.virtual_half_m = 0.5;
+  MissionController mission(virtuals, bank());
+  mission.start();
+  mission.takeEvents();
+  mission.step(at(4.8, 0.7, 1.5), 0.0);
+  const StepResult wide = mission.step(at(5.2, 0.7, 1.5), kDt);
+  EXPECT_EQ(mission.phase(), Phase::Race);
+  EXPECT_EQ(wide.status.target, 0);
+  EXPECT_EQ(wide.status.gates_passed, 0);
+  EXPECT_EQ(wide.status.exit_reason, ExitReason::None);
+  EXPECT_TRUE(wide.status.last_crossing.available);
+  EXPECT_FALSE(wide.status.last_crossing.passed);
+  EXPECT_FALSE(wide.status.last_crossing.valid);
+  EXPECT_EQ(wide.status.last_crossing.gate, 0u);
+  EXPECT_NEAR(wide.status.last_crossing.crossing.lateral, 0.7, 1e-9);
+  EXPECT_EQ(race->calls(), 2u);
+  EXPECT_EQ(hover->calls(), 0u);
+  auto events = mission.takeEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].type, MissionEvent::Type::GateOutside);
+  EXPECT_EQ(events[0].gate, 0u);
+  EXPECT_DOUBLE_EQ(events[0].window_m, 0.5);
+  EXPECT_EQ(
+    rl_policy::describe(events[0]),
+    "Gate 0 crossed outside its virtual window: lateral 0.700 m, vertical 0.000 m, not inside "
+    "0.500 m; no pass, gate 0 stays the target");
+
+  // Round again, back behind the plane, and through the window.
+  mission.step(at(4.8, 0.1, 1.5), 2 * kDt);
+  const StepResult pass = mission.step(at(5.2, 0.1, 1.5), 3 * kDt);
+  EXPECT_EQ(mission.phase(), Phase::Race);
+  EXPECT_EQ(pass.status.target, 1);
+  EXPECT_EQ(pass.status.gates_passed, 1);
+  EXPECT_TRUE(pass.status.last_crossing.passed);
+  EXPECT_TRUE(pass.status.last_crossing.valid);
+  events = mission.takeEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].type, MissionEvent::Type::GatePassed);
+}
+
+TEST_F(Mission, TheVirtualFixtureSequenceFliesThroughTheMission) {
+  const YAML::Node fixture = rl_policy_test::loadFixture("virtual_gates.yaml");
+  MissionConfig virtuals = config(MissionType::Race, fixture["sequence"]["laps"].as<int>());
+  virtuals.gates = rl_policy_test::courseGates(fixture["course"]);
+  for (rl_policy::Gate & gate : virtuals.gates) {
+    gate.shape = GateShape::Virtual;
+  }
+  virtuals.virtual_half_m = fixture["virtual_half_m"].as<double>();
+  MissionController mission(virtuals, bank());
+  mission.start();
+  const YAML::Node positions = fixture["sequence"]["positions"];
+  const YAML::Node steps = fixture["sequence"]["steps"];
+  std::vector<MissionEvent> events;
+  int outside = 0;
+  for (std::size_t k = 0; k < positions.size(); ++k) {
+    const auto p = rl_policy_test::doubles(positions[k]);
+    ASSERT_EQ(mission.phase(), Phase::Race) << "position " << k;
+    mission.step(at(p.at(0), p.at(1), p.at(2)), static_cast<double>(k) * kDt);
+    for (const MissionEvent & event : mission.takeEvents()) {
+      events.push_back(event);
+    }
+    if (k > 0) {
+      const std::string expected = steps[k - 1]["event"].as<std::string>();
+      outside += expected == "outside" ? 1 : 0;
+      if (expected != "finished") {
+        EXPECT_EQ(mission.status().target, steps[k - 1]["target"].as<int>()) << "step " << k;
+      }
+      EXPECT_EQ(mission.status().gates_passed, steps[k - 1]["gates_passed"].as<int>()) << k;
+    }
+  }
+  EXPECT_EQ(mission.phase(), Phase::Hold);
+  EXPECT_EQ(mission.status().exit_reason, ExitReason::Finished);
+  EXPECT_EQ(
+    ofType(events, MissionEvent::Type::GateOutside).size(), static_cast<std::size_t>(outside));
+  EXPECT_EQ(ofType(events, MissionEvent::Type::GatePassed).size(), virtuals.gates.size());
+  EXPECT_GE(outside, 3);
+}
+
+TEST_F(Mission, AVirtualCourseNeedsItsWindow) {
+  MissionConfig virtuals = config();
+  virtuals.gates[1].shape = GateShape::Virtual;
+  EXPECT_THROW(MissionController(virtuals, bank()), std::invalid_argument);
+  try {
+    MissionController mission(virtuals, bank());
+  } catch (const std::invalid_argument & e) {
+    EXPECT_NE(std::string(e.what()).find("race.virtual_half_m"), std::string::npos);
+  }
+  EXPECT_THROW(MissionController(virtuals, bank(false, true)), std::invalid_argument);
+  for (const double bad : {0.0, -0.4, std::numeric_limits<double>::quiet_NaN()}) {
+    virtuals.virtual_half_m = bad;
+    EXPECT_THROW(MissionController(virtuals, bank()), std::invalid_argument) << bad;
+  }
+  virtuals.virtual_half_m = 0.5;
+  MissionController mission(virtuals, bank());
+  EXPECT_DOUBLE_EQ(*mission.sequencer().config().virtual_half_m, 0.5);
+  EXPECT_EQ(mission.sequencer().course().gate(1).shape, GateShape::Virtual);
+}
+
+TEST_F(Mission, ThePredictedStop) {
+  const Eigen::Vector3d p(1.0, 2.0, 3.0);
+  const Eigen::Vector3d v(3.0, -4.0, 0.0);
+  EXPECT_TRUE(rl_policy::predictedStop(p, v, 0.1, 5.0).isApprox(
+      p + 0.1 * v + v * 5.0 / 10.0, 1e-15));
+  EXPECT_TRUE(rl_policy::predictedStop(p, v, 0.1, 0.0).isApprox(p + 0.1 * v, 1e-15));
+  EXPECT_EQ(rl_policy::predictedStop(p, v, 0.0, 0.0), p);
+  EXPECT_EQ(rl_policy::predictedStop(p, Eigen::Vector3d::Zero(), 0.2, 3.0), p);
+  EXPECT_FALSE(MissionConfig().stopCheck());
+}
+
+TEST_F(Mission, TheStopCheckOffReadsThePositionAlone) {
+  MissionController mission(config(), bank());
+  EXPECT_FALSE(mission.config().stopCheck());
+  mission.start();
+  // Inside, however fast towards the edge.
+  for (int step = 0; step < 10; ++step) {
+    mission.step(moving(29.0, 4.0, 9.5, 80.0, 80.0, 80.0), step * kDt);
+  }
+  EXPECT_EQ(mission.phase(), Phase::Race);
+  EXPECT_FALSE(mission.status().predicted_stop.has_value());
+  for (int step = 0; step < 3; ++step) {
+    mission.step(moving(31.0, 0.0, 1.5, -80.0, 0.0, 0.0), (10 + step) * kDt);
+  }
+  EXPECT_EQ(mission.status().exit_reason, ExitReason::OutOfBounds);
+  const auto exits = ofType(mission.takeEvents(), MissionEvent::Type::PhaseChange);
+  ASSERT_FALSE(exits.empty());
+  EXPECT_FALSE(exits.back().predicted_stop.has_value());
+  EXPECT_EQ(
+    rl_policy::describe(exits.back()).rfind("Out of bounds at [31.00, 0.00, 1.50] (", 0), 0u);
+}
+
+TEST_F(Mission, APredictedStopOutsideExitsWhileThePositionIsInside) {
+  MissionConfig stopping = config();
+  stopping.stop_latency_s = 0.1;
+  stopping.stop_decel_ms2 = 5.0;
+  MissionController mission(stopping, bank());
+  mission.start();
+  mission.takeEvents();
+  // 25 + 0.8 + 64 / 10 = 32.2, past 30 + 0.5.
+  const VehicleState state = moving(25.0, 0.0, 1.5, 8.0, 0.0, 0.0);
+  mission.step(state, 0.0);
+  mission.step(state, kDt);
+  EXPECT_EQ(mission.phase(), Phase::Race);
+  ASSERT_TRUE(mission.status().predicted_stop.has_value());
+  EXPECT_TRUE(mission.status().predicted_stop->isApprox(Eigen::Vector3d(32.2, 0.0, 1.5), 1e-12));
+  const StepResult exit = mission.step(state, 2 * kDt);
+  EXPECT_EQ(mission.phase(), Phase::Hold);
+  EXPECT_EQ(exit.status.exit_reason, ExitReason::OutOfBounds);
+  EXPECT_EQ(exit.status.setpoint.position, Eigen::Vector3d(25.0, 0.0, 1.5));
+  EXPECT_EQ(exit.status.setpoint_source, SetpointSource::Here);
+  const auto exits = ofType(mission.takeEvents(), MissionEvent::Type::PhaseChange);
+  ASSERT_EQ(exits.size(), 1u);
+  EXPECT_FALSE(exits[0].position_outside);
+  EXPECT_TRUE(exits[0].stop_outside);
+  EXPECT_EQ(
+    rl_policy::describe(exits[0]),
+    "Out of bounds: the predicted stop is outside, position [25.00, 0.00, 1.50], predicted stop "
+    "[32.20, 0.00, 1.50] (race -> hold): hold at [25.000, 0.000, 1.500] yaw 0.000 rad with "
+    "policy 'hover'");
+}
+
+TEST_F(Mission, AVelocityPointingInwardDoesNotExit) {
+  MissionConfig stopping = config();
+  stopping.stop_latency_s = 0.1;
+  stopping.stop_decel_ms2 = 5.0;
+  MissionController mission(stopping, bank());
+  mission.start();
+  for (int step = 0; step < 20; ++step) {
+    mission.step(moving(29.0, -4.5, 9.0, -8.0, 3.0, -2.0), step * kDt);
+  }
+  EXPECT_EQ(mission.phase(), Phase::Race);
+  EXPECT_LT(mission.status().predicted_stop->x(), 29.0);
+}
+
+TEST_F(Mission, TheCeilingIsJudgedOnTheVerticalStop) {
+  MissionConfig stopping = config();
+  stopping.stop_latency_s = 0.1;
+  stopping.stop_decel_ms2 = 5.0;
+  // 8 + 0.39 + 3.9^2 / 10 = 9.911 is below the ceiling; 8 + 0.5 + 2.5 is above it.
+  MissionController below(stopping, bank());
+  below.start();
+  for (int step = 0; step < 10; ++step) {
+    below.step(moving(0.0, 0.0, 8.0, 0.0, 0.0, 3.9), step * kDt);
+  }
+  EXPECT_EQ(below.phase(), Phase::Race);
+  MissionController climbing(stopping, bank());
+  climbing.start();
+  for (int step = 0; step < 3; ++step) {
+    climbing.step(moving(0.0, 0.0, 8.0, 0.0, 0.0, 5.0), step * kDt);
+  }
+  EXPECT_EQ(climbing.status().exit_reason, ExitReason::OutOfBounds);
+  MissionController sinking(stopping, bank());
+  sinking.start();
+  for (int step = 0; step < 10; ++step) {
+    sinking.step(moving(0.0, 0.0, 8.0, 0.0, 0.0, -5.0), step * kDt);
+  }
+  EXPECT_EQ(sinking.phase(), Phase::Race);
+}
+
+TEST_F(Mission, TheStopCheckIsDebouncedWithThePosition) {
+  MissionConfig stopping = config();
+  stopping.stop_latency_s = 0.1;
+  stopping.stop_decel_ms2 = 5.0;
+  MissionController mission(stopping, bank());
+  mission.start();
+  const VehicleState fast = moving(25.0, 0.0, 1.5, 8.0, 0.0, 0.0);
+  const VehicleState slow = moving(25.0, 0.0, 1.5, 1.0, 0.0, 0.0);
+  const VehicleState out = moving(31.0, 0.0, 1.5, -1.0, 0.0, 0.0);
+  int step = 0;
+  for (const VehicleState & state : {fast, fast, slow, fast, out, slow}) {
+    mission.step(state, (step++) * kDt);
+    EXPECT_EQ(mission.phase(), Phase::Race) << "step " << step;
+  }
+  // Two outside tests in a row, then the third step outside by either.
+  mission.step(fast, (step++) * kDt);
+  mission.step(out, (step++) * kDt);
+  EXPECT_EQ(mission.phase(), Phase::Race);
+  mission.step(fast, (step++) * kDt);
+  EXPECT_EQ(mission.status().exit_reason, ExitReason::OutOfBounds);
+  const auto exits = ofType(mission.takeEvents(), MissionEvent::Type::PhaseChange);
+  ASSERT_FALSE(exits.empty());
+  EXPECT_EQ(
+    rl_policy::describe(exits.back()).rfind("Out of bounds: the predicted stop is", 0), 0u);
+}
+
+TEST_F(Mission, LatencyAloneOrDecelerationAloneSwitchesTheStopCheckOn) {
+  MissionConfig latency = config();
+  latency.stop_latency_s = 1.0;
+  EXPECT_TRUE(latency.stopCheck());
+  MissionController drifting(latency, bank());
+  drifting.start();
+  for (int step = 0; step < 3; ++step) {
+    drifting.step(moving(25.0, 0.0, 1.5, 6.0, 0.0, 0.0), step * kDt);
+  }
+  EXPECT_EQ(drifting.status().exit_reason, ExitReason::OutOfBounds);
+  EXPECT_TRUE(drifting.status().predicted_stop->isApprox(Eigen::Vector3d(31.0, 0.0, 1.5), 1e-12));
+
+  MissionConfig braking = config();
+  braking.stop_decel_ms2 = 5.0;
+  EXPECT_TRUE(braking.stopCheck());
+  MissionController mission(braking, bank());
+  mission.start();
+  for (int step = 0; step < 3; ++step) {
+    mission.step(moving(25.0, 0.0, 1.5, 8.0, 0.0, 0.0), step * kDt);
+  }
+  EXPECT_EQ(mission.status().exit_reason, ExitReason::OutOfBounds);
+  EXPECT_TRUE(mission.status().predicted_stop->isApprox(Eigen::Vector3d(31.4, 0.0, 1.5), 1e-12));
+}
+
+TEST_F(Mission, BothOutsideSaysBoth) {
+  MissionConfig stopping = config();
+  stopping.stop_latency_s = 0.1;
+  MissionController mission(stopping, bank());
+  mission.start();
+  for (int step = 0; step < 3; ++step) {
+    mission.step(moving(31.0, 0.0, 1.5, 1.0, 0.0, 0.0), step * kDt);
+  }
+  const auto exits = ofType(mission.takeEvents(), MissionEvent::Type::PhaseChange);
+  ASSERT_FALSE(exits.empty());
+  EXPECT_TRUE(exits.back().position_outside);
+  EXPECT_TRUE(exits.back().stop_outside);
+  EXPECT_EQ(
+    rl_policy::describe(exits.back()).rfind(
+      "Out of bounds: the position and the predicted stop are outside, position [31.00, 0.00, "
+      "1.50], predicted stop [31.10, 0.00, 1.50] (", 0), 0u);
+  EXPECT_EQ(mission.status().setpoint.position, Eigen::Vector3d(30.0, 0.0, 1.5));
+}
+
+TEST_F(Mission, TheStopCheckIsValidated) {
+  for (const double bad : {-0.1, std::numeric_limits<double>::quiet_NaN(),
+      std::numeric_limits<double>::infinity()})
+  {
+    MissionConfig latency = config();
+    latency.stop_latency_s = bad;
+    EXPECT_THROW(MissionController(latency, bank()), std::invalid_argument) << bad;
+    MissionConfig decel = config();
+    decel.stop_decel_ms2 = bad;
+    EXPECT_THROW(MissionController(decel, bank()), std::invalid_argument) << bad;
+  }
 }

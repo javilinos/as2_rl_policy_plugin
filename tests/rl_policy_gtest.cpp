@@ -134,6 +134,15 @@ geometry_msgs::msg::TwistStamped twist()
   return msg;
 }
 
+geometry_msgs::msg::TwistStamped twist(double vx, double vy, double vz)
+{
+  geometry_msgs::msg::TwistStamped msg = twist();
+  msg.twist.linear.x = vx;
+  msg.twist.linear.y = vy;
+  msg.twist.linear.z = vz;
+  return msg;
+}
+
 std::map<std::string, std::string> values(const diagnostic_msgs::msg::DiagnosticStatus & status)
 {
   std::map<std::string, std::string> out;
@@ -424,10 +433,12 @@ TEST_F(PluginTest, RefusesShapesAndOctagonWindowsThatDoNotFit) {
   EXPECT_NE(statusMessage().find("has 11 entries, the course has 12 gates"), std::string::npos);
 
   std::vector<int64_t> unknown(12, 0);
-  unknown[4] = 2;
+  unknown[4] = 3;
   build(with(parameters, shapes(unknown)));
   EXPECT_FALSE(plugin_->isReady());
-  EXPECT_NE(statusMessage().find("entry 4 is 2"), std::string::npos);
+  EXPECT_NE(
+    statusMessage().find("entry 4 is 3: 0 is a square, 1 an octagon, 2 a virtual gate"),
+    std::string::npos);
 
   build(
     with(
@@ -444,6 +455,125 @@ TEST_F(PluginTest, RefusesShapesAndOctagonWindowsThatDoNotFit) {
     statusMessage().find("race.octagon_pass_tolerance_m must be positive"), std::string::npos);
   build(with(parameters, rclcpp::Parameter("rl_policy.race.octagon_valid_half_m", -0.4)));
   EXPECT_FALSE(plugin_->isReady());
+}
+
+TEST_F(PluginTest, ReadsVirtualGatesAndTheirWindow) {
+  std::vector<int64_t> shapes(12, 2);
+  shapes[0] = 0;
+  shapes[5] = 1;
+  auto parameters = flightParameters(rl_policy_test::fixturePath(kPolicyFixture));
+  parameters = with(parameters, rclcpp::Parameter("rl_policy.course.gates_shape", shapes));
+  parameters = with(parameters, rclcpp::Parameter("rl_policy.race.virtual_half_m", 0.5));
+  build(parameters);
+  ASSERT_TRUE(plugin_->isReady());
+  const rl_policy::MissionConfig & config = plugin_->mission()->config();
+  EXPECT_EQ(config.gates[0].shape, rl_policy::GateShape::Square);
+  EXPECT_EQ(config.gates[5].shape, rl_policy::GateShape::Octagon);
+  EXPECT_EQ(config.gates[7].shape, rl_policy::GateShape::Virtual);
+  EXPECT_EQ(
+    rl_policy::countShape(plugin_->mission()->sequencer().course(), rl_policy::GateShape::Virtual),
+    10u);
+  const rl_policy::SequencerConfig & sequencer = plugin_->mission()->sequencer().config();
+  EXPECT_DOUBLE_EQ(sequencer.passTolerance(rl_policy::GateShape::Virtual), 0.5);
+  EXPECT_DOUBLE_EQ(sequencer.validHalf(rl_policy::GateShape::Virtual), 0.5);
+  EXPECT_DOUBLE_EQ(
+    sequencer.passTolerance(rl_policy::GateShape::Square),
+    node_->get_parameter("rl_policy.race.pass_tolerance_m").as_double());
+  EXPECT_FALSE(config.stopCheck());
+}
+
+TEST_F(PluginTest, RefusesVirtualGatesWithoutAWindowThatFits) {
+  const auto parameters = with(
+    flightParameters(rl_policy_test::fixturePath(kPolicyFixture)),
+    rclcpp::Parameter("rl_policy.course.gates_shape", std::vector<int64_t>(12, 2)));
+  build(parameters);
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_FALSE(plugin_->setMode(kTrajectory, kBodyRates));
+  EXPECT_NE(statusMessage().find("race.virtual_half_m, their window, is not set"),
+    std::string::npos);
+
+  build(with(parameters, rclcpp::Parameter("rl_policy.race.virtual_half_m", 0.0)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(
+    statusMessage().find("race.virtual_half_m must be finite and positive"), std::string::npos);
+  build(with(parameters, rclcpp::Parameter("rl_policy.race.virtual_half_m", 1)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("race.virtual_half_m must be of type double"), std::string::npos);
+
+  // A window on a course of squares is harmless, but it must still be a window.
+  const auto squares = flightParameters(rl_policy_test::fixturePath(kPolicyFixture));
+  build(with(squares, rclcpp::Parameter("rl_policy.race.virtual_half_m", 0.5)));
+  EXPECT_TRUE(plugin_->isReady());
+  build(with(squares, rclcpp::Parameter("rl_policy.race.virtual_half_m", -0.5)));
+  EXPECT_FALSE(plugin_->isReady());
+}
+
+TEST_F(PluginTest, ReadsTheStopCheckAndReportsThePredictedStop) {
+  auto parameters = flightParameters(rl_policy_test::fixturePath(kPolicyFixture));
+  parameters = with(parameters, rclcpp::Parameter("rl_policy.race.stop_latency_s", 0.1));
+  parameters = with(parameters, rclcpp::Parameter("rl_policy.race.stop_decel_ms2", 5.0));
+  build(parameters);
+  ASSERT_TRUE(plugin_->isReady());
+  const rl_policy::MissionConfig & config = plugin_->mission()->config();
+  EXPECT_TRUE(config.stopCheck());
+  EXPECT_DOUBLE_EQ(config.stop_latency_s, 0.1);
+  EXPECT_DOUBLE_EQ(config.stop_decel_ms2, 5.0);
+
+  setTime(40.0);
+  ASSERT_TRUE(plugin_->setMode(kTrajectory, kBodyRates));
+  plugin_->reset();
+  plugin_->setHoverEnabled(false);
+  plugin_->updateState(pose(14.5, 12.0, 2.0, 3.14), twist(0.0, -5.0, 0.0));
+  ASSERT_TRUE(firstStep());
+  // 12 - 0.5 - 25 / 10 = 9.0: inside, so the race goes on.
+  EXPECT_EQ(plugin_->mission()->phase(), Phase::Race);
+  ASSERT_TRUE(missionStatus().predicted_stop.has_value());
+  EXPECT_TRUE(
+    missionStatus().predicted_stop->isApprox(Eigen::Vector3d(14.5, 9.0, 2.0), 1e-12));
+  statuses_.clear();
+  setTime(40.25);
+  spin(std::chrono::milliseconds(300));
+  ASSERT_FALSE(statuses_.empty());
+  auto status = values(statuses_.back());
+  EXPECT_EQ(status["predicted_stop_x"], std::to_string(14.5));
+  EXPECT_EQ(status["predicted_stop_y"], std::to_string(9.0));
+  EXPECT_EQ(status["predicted_stop_z"], std::to_string(2.0));
+}
+
+TEST_F(PluginTest, WithoutTheStopCheckTheStatusCarriesNoStop) {
+  build(flightParameters(rl_policy_test::fixturePath(kPolicyFixture)));
+  ASSERT_TRUE(plugin_->isReady());
+  EXPECT_FALSE(plugin_->mission()->config().stopCheck());
+  setTime(60.0);
+  setTrajectoryMode(pose(14.5, 12.0, 2.0, 3.14));
+  plugin_->updateState(pose(14.5, 12.0, 2.0, 3.14), twist(0.0, -50.0, 0.0));
+  ASSERT_TRUE(firstStep());
+  EXPECT_FALSE(missionStatus().predicted_stop.has_value());
+  statuses_.clear();
+  setTime(60.25);
+  spin(std::chrono::milliseconds(300));
+  ASSERT_FALSE(statuses_.empty());
+  EXPECT_EQ(values(statuses_.back()).count("predicted_stop_x"), 0u);
+}
+
+TEST_F(PluginTest, RefusesAStopCheckThatDoesNotFit) {
+  const auto parameters = flightParameters(rl_policy_test::fixturePath(kPolicyFixture));
+  build(with(parameters, rclcpp::Parameter("rl_policy.race.stop_latency_s", -0.1)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(
+    statusMessage().find("race.stop_latency_s must be finite and not negative"),
+    std::string::npos);
+  build(with(parameters, rclcpp::Parameter("rl_policy.race.stop_decel_ms2", -2.0)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(
+    statusMessage().find("race.stop_decel_ms2 must be finite and not negative"),
+    std::string::npos);
+  build(with(parameters, rclcpp::Parameter("rl_policy.race.stop_decel_ms2", 5)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("race.stop_decel_ms2 must be of type double"), std::string::npos);
+  build(with(parameters, rclcpp::Parameter("rl_policy.race.stop_latency_s", 0.0)));
+  EXPECT_TRUE(plugin_->isReady());
+  EXPECT_FALSE(plugin_->mission()->config().stopCheck());
 }
 
 TEST_F(PluginTest, HoverMissionNeedsOnlyTheHoverPolicy) {
