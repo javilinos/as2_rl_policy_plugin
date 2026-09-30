@@ -41,19 +41,19 @@ double openingNorm(GateShape shape, double lateral, double vertical)
 
 double SequencerConfig::passTolerance(GateShape shape) const
 {
-  if (shape == GateShape::Virtual) {
-    return virtual_half_m.value_or(0.0);
-  }
   return shape == GateShape::Octagon ?
          octagon_pass_tolerance_m.value_or(pass_tolerance_m) : pass_tolerance_m;
 }
 
 double SequencerConfig::validHalf(GateShape shape) const
 {
-  if (shape == GateShape::Virtual) {
-    return virtual_half_m.value_or(0.0);
-  }
   return shape == GateShape::Octagon ? octagon_valid_half_m.value_or(valid_half_m) : valid_half_m;
+}
+
+double SequencerConfig::validHalf(const Gate & gate) const
+{
+  return gate.is_virtual ? virtual_valid_half_m.value_or(validHalf(gate.shape)) :
+         validHalf(gate.shape);
 }
 
 const char * toString(GateShape shape)
@@ -63,8 +63,6 @@ const char * toString(GateShape shape)
       return "square";
     case GateShape::Octagon:
       return "octagon";
-    case GateShape::Virtual:
-      return "virtual";
   }
   return "unknown";
 }
@@ -74,6 +72,13 @@ std::size_t countShape(const Course & course, GateShape shape)
   return static_cast<std::size_t>(std::count_if(
            course.gates().begin(), course.gates().end(),
            [shape](const Gate & gate) {return gate.shape == shape;}));
+}
+
+std::size_t countVirtual(const Course & course)
+{
+  return static_cast<std::size_t>(std::count_if(
+           course.gates().begin(), course.gates().end(),
+           [](const Gate & gate) {return gate.is_virtual;}));
 }
 
 GateSequencer::GateSequencer(Course course, SequencerConfig config)
@@ -91,15 +96,10 @@ GateSequencer::GateSequencer(Course course, SequencerConfig config)
     throw std::invalid_argument(
             "race.octagon_pass_tolerance_m and race.octagon_valid_half_m must be positive");
   }
-  if (config_.virtual_half_m &&
-    !(std::isfinite(*config_.virtual_half_m) && *config_.virtual_half_m > 0.0))
+  if (config_.virtual_valid_half_m &&
+    !(std::isfinite(*config_.virtual_valid_half_m) && *config_.virtual_valid_half_m > 0.0))
   {
-    throw std::invalid_argument("race.virtual_half_m must be finite and positive");
-  }
-  if (countShape(course_, GateShape::Virtual) > 0 && !config_.virtual_half_m) {
-    throw std::invalid_argument(
-            "the course has virtual gates (course.gates_shape 2) and race.virtual_half_m, "
-            "their window, is not set");
+    throw std::invalid_argument("race.virtual_valid_half_m must be finite and positive");
   }
   if (!(config_.gate_timeout_s > 0.0) || !(config_.dt > 0.0)) {
     throw std::invalid_argument("race.gate_timeout_s and the policy dt must be positive");
@@ -128,9 +128,9 @@ GateUpdate GateSequencer::update(const Eigen::Vector3d & previous, const Eigen::
   if (update.crossing.crossed) {
     const double worst =
       openingNorm(gate.shape, update.crossing.lateral, update.crossing.vertical);
-    update.valid = worst < config_.validHalf(gate.shape);
+    update.valid = worst < config_.validHalf(gate);
     const bool inside = worst < config_.passTolerance(gate.shape);
-    if (!inside && gate.shape != GateShape::Virtual) {
+    if (!inside && !gate.is_virtual) {
       update.event = GateEvent::Missed;
       return update;
     }

@@ -162,15 +162,17 @@ std::string describe(const MissionEvent & event)
 {
   if (event.type == MissionEvent::Type::GatePassed) {
     return format(
-      "Gate %zu passed: lateral %.3f m, vertical %.3f m, %s; %d gates passed, %d laps completed",
-      event.gate, event.crossing.lateral, event.crossing.vertical,
-      event.valid ? "valid" : "outside the valid opening", event.gates_passed, event.lap);
+      "Gate %zu passed%s: lateral %.3f m, vertical %.3f m, %s; %d gates passed, %d laps "
+      "completed", event.gate, event.is_virtual ? " (virtual)" : "", event.crossing.lateral,
+      event.crossing.vertical, event.valid ? "valid" : "outside the valid opening",
+      event.gates_passed, event.lap);
   }
   if (event.type == MissionEvent::Type::GateOutside) {
     return format(
-      "Gate %zu crossed outside its virtual window: lateral %.3f m, vertical %.3f m, not "
-      "inside %.3f m; no pass, gate %zu stays the target", event.gate, event.crossing.lateral,
-      event.crossing.vertical, event.window_m, event.gate);
+      "Gate %zu (virtual %s) crossed outside its window: lateral %.3f m, vertical %.3f m, not "
+      "inside %.3f m; no pass and no miss, gate %zu stays the target", event.gate,
+      toString(event.shape), event.crossing.lateral, event.crossing.vertical, event.window_m,
+      event.gate);
   }
   if (event.type == MissionEvent::Type::SetpointChange) {
     return format(
@@ -263,16 +265,9 @@ MissionConfig MissionController::validated(MissionConfig config, const PolicyBan
     !config.octagon_valid_half_m || *config.octagon_valid_half_m > 0.0,
     "race.octagon_valid_half_m must be positive");
   require(
-    !config.virtual_half_m ||
-    (std::isfinite(*config.virtual_half_m) && *config.virtual_half_m > 0.0),
-    "race.virtual_half_m must be finite and positive");
-  const bool virtual_gates = std::any_of(
-    config.gates.begin(), config.gates.end(),
-    [](const Gate & gate) {return gate.shape == GateShape::Virtual;});
-  require(
-    !virtual_gates || config.virtual_half_m.has_value(),
-    "the course has virtual gates (course.gates_shape 2) and race.virtual_half_m, their "
-    "window, is not set");
+    !config.virtual_valid_half_m ||
+    (std::isfinite(*config.virtual_valid_half_m) && *config.virtual_valid_half_m > 0.0),
+    "race.virtual_valid_half_m must be finite and positive");
   require(config.gate_timeout_s > 0.0, "race.gate_timeout_s must be positive");
   require(config.bounds_margin_m >= 0.0, "race.bounds_margin_m must not be negative");
   require(std::isfinite(config.ceiling_m), "race.ceiling_m must be finite");
@@ -302,7 +297,7 @@ MissionController::MissionController(MissionConfig config, PolicyBank policies)
     Course(config_.gates, config_.bounds),
     SequencerConfig{config_.laps, config_.pass_tolerance_m, config_.valid_half_m,
       config_.gate_timeout_s, policies_.dt(), config_.octagon_pass_tolerance_m,
-      config_.octagon_valid_half_m, config_.virtual_half_m}),
+      config_.octagon_valid_half_m, config_.virtual_valid_half_m}),
   hold_course_(Course::single(config_.hold_setpoint))
 {
   if (config_.type == MissionType::Hover) {
@@ -464,6 +459,7 @@ void MissionController::raceChecks(const VehicleState & state)
       status_.last_crossing = CrossingRecord{true, update.gate, update.crossing, passed,
         update.valid};
     }
+    const Gate & gate = sequencer_.course().gate(update.gate);
     if (passed) {
       MissionEvent event;
       event.type = MissionEvent::Type::GatePassed;
@@ -475,6 +471,8 @@ void MissionController::raceChecks(const VehicleState & state)
       event.gates_passed = status_.gates_passed;
       event.crossing = update.crossing;
       event.valid = update.valid;
+      event.is_virtual = gate.is_virtual;
+      event.shape = gate.shape;
       events_.push_back(event);
     } else if (update.crossing.crossed && update.event != GateEvent::Missed) {
       // Only a virtual gate's plane is crossed without a pass or a miss.
@@ -487,8 +485,10 @@ void MissionController::raceChecks(const VehicleState & state)
       event.lap = status_.lap;
       event.gates_passed = status_.gates_passed;
       event.crossing = update.crossing;
-      event.window_m =
-        sequencer_.config().passTolerance(sequencer_.course().gate(update.gate).shape);
+      event.valid = update.valid;
+      event.is_virtual = gate.is_virtual;
+      event.shape = gate.shape;
+      event.window_m = sequencer_.config().passTolerance(gate.shape);
       events_.push_back(event);
     }
     switch (update.event) {

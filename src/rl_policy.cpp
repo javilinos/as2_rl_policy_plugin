@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <system_error>
 #include <utility>
 
@@ -27,9 +28,10 @@ const std::vector<std::string> & optionalInitParameters()
 {
   static const std::vector<std::string> tails = {
     "course.gates_shape",
+    "course.gates_virtual",
     "race.octagon_pass_tolerance_m",
     "race.octagon_valid_half_m",
-    "race.virtual_half_m",
+    "race.virtual_valid_half_m",
     "race.stop_latency_s",
     "race.stop_decel_ms2",
   };
@@ -40,6 +42,18 @@ bool isOptionalInitParameter(const std::string & tail)
 {
   const std::vector<std::string> & tails = optionalInitParameters();
   return std::find(tails.begin(), tails.end(), tail) != tails.end();
+}
+
+// Keys this plugin no longer reads, refused with what replaced them.
+const std::map<std::string, std::string> & removedParameters()
+{
+  static const std::map<std::string, std::string> removed = {
+    {"race.virtual_half_m",
+      "is removed: a virtual gate passes inside its shape's race.pass_tolerance_m or "
+      "race.octagon_pass_tolerance_m as a physical one does (course.gates_virtual marks it), "
+      "and race.virtual_valid_half_m is its logged valid window"},
+  };
+  return removed;
 }
 
 // Relative to the working directory, where the policy loader resolves it.
@@ -110,6 +124,16 @@ std::vector<std::string> Plugin::initParameters() const
 
 void Plugin::updateParameter(const std::string & name, const rclcpp::Parameter & parameter)
 {
+  const auto removed = removedParameters().find(name);
+  if (removed != removedParameters().end()) {
+    // Refused when the plugin is built; a later change is only warned about.
+    if (ready_) {
+      RCLCPP_WARN(
+        getNodePtr()->get_logger(), "Parameter '%s' %s; the change has no effect",
+        param(name).c_str(), removed->second.c_str());
+    }
+    return;
+  }
   if (isOptionalInitParameter(name)) {
     // The dispatch that follows initialize() repeats what ownInitialize() read.
     const auto it = parameters_.find(name);
@@ -255,13 +279,34 @@ void Plugin::readSettings(Settings & settings)
         mission.gates[i].shape = GateShape::Square;
       } else if (values[i] == static_cast<int64_t>(GateShape::Octagon)) {
         mission.gates[i].shape = GateShape::Octagon;
-      } else if (values[i] == static_cast<int64_t>(GateShape::Virtual)) {
-        mission.gates[i].shape = GateShape::Virtual;
+      } else if (values[i] == 2) {
+        refuse(
+          param("course.gates_shape") + " entry " + std::to_string(i) + " is 2, which is no "
+          "longer a shape: a virtual gate is now " + param("course.gates_virtual") +
+          " true, with its geometry here (0 a square, 1 an octagon)");
       } else {
         refuse(
           param("course.gates_shape") + " entry " + std::to_string(i) + " is " +
-          std::to_string(values[i]) + ": 0 is a square, 1 an octagon, 2 a virtual gate");
+          std::to_string(values[i]) + ": 0 is a square, 1 an octagon");
       }
+    }
+  }
+  const auto * virtuals =
+    optionalSetting("course.gates_virtual", ParameterType::PARAMETER_BOOL_ARRAY);
+  if (virtuals && !mission.gates.empty()) {
+    const std::vector<bool> values = virtuals->as_bool_array();
+    if (values.size() != mission.gates.size()) {
+      refuse(
+        param("course.gates_virtual") + " has " + std::to_string(values.size()) +
+        " entries, the course has " + std::to_string(mission.gates.size()) + " gates");
+    }
+    for (std::size_t i = 0; i < values.size() && i < mission.gates.size(); ++i) {
+      mission.gates[i].is_virtual = values[i];
+    }
+  }
+  for (const auto & [tail, message] : removedParameters()) {
+    if (getNodePtr()->has_parameter(param(tail))) {
+      refuse(param(tail) + " " + message);
     }
   }
   if (const auto * p = setting("course.bounds_x", ParameterType::PARAMETER_DOUBLE_ARRAY)) {
@@ -303,8 +348,10 @@ void Plugin::readSettings(Settings & settings)
   {
     mission.octagon_valid_half_m = p->as_double();
   }
-  if (const auto * p = optionalSetting("race.virtual_half_m", ParameterType::PARAMETER_DOUBLE)) {
-    mission.virtual_half_m = p->as_double();
+  if (const auto * p =
+    optionalSetting("race.virtual_valid_half_m", ParameterType::PARAMETER_DOUBLE))
+  {
+    mission.virtual_valid_half_m = p->as_double();
   }
   if (const auto * p = optionalSetting("race.stop_latency_s", ParameterType::PARAMETER_DOUBLE)) {
     mission.stop_latency_s = p->as_double();
@@ -465,14 +512,40 @@ void Plugin::ownInitialize()
       "rl_policy ready: %s mission, %zu gates, %d laps, step %.4f s, motor speeds from '%s'",
       toString(config.type), config.gates.size(), config.laps, dt_,
       motor_speed_sub_->get_topic_name());
-    const std::size_t virtual_gates =
-      countShape(mission_->sequencer().course(), GateShape::Virtual);
+    const Course & course = mission_->sequencer().course();
+    const SequencerConfig & windows = mission_->sequencer().config();
+    const std::size_t octagons = countShape(course, GateShape::Octagon);
+    const std::size_t virtual_gates = countVirtual(course);
+    if (config.type == MissionType::Race) {
+      char octagon_pass[128] = "";
+      if (octagons > 0) {
+        std::snprintf(
+          octagon_pass, sizeof(octagon_pass),
+          ", %zu octagons max(|u|, |v|, (|u| + |v|) / sqrt(2)) < %.3f m "
+          "(race.octagon_pass_tolerance_m)", octagons, windows.passTolerance(GateShape::Octagon));
+      }
+      RCLCPP_INFO(
+        logger,
+        "Pass windows, virtual gates alike: %zu squares max(|u|, |v|) < %.3f m "
+        "(race.pass_tolerance_m)%s", course.size() - octagons,
+        windows.passTolerance(GateShape::Square), octagon_pass);
+      char virtual_valid[80] = "";
+      if (windows.virtual_valid_half_m) {
+        std::snprintf(
+          virtual_valid, sizeof(virtual_valid), ", virtual %.3f m (race.virtual_valid_half_m)",
+          *windows.virtual_valid_half_m);
+      }
+      RCLCPP_INFO(
+        logger,
+        "Valid windows, logged only: square %.3f m (race.valid_half_m), octagon %.3f m "
+        "(race.octagon_valid_half_m)%s; a crossing inside is logged valid, never passed by it",
+        windows.validHalf(GateShape::Square), windows.validHalf(GateShape::Octagon), virtual_valid);
+    }
     if (config.type == MissionType::Race && virtual_gates > 0) {
       RCLCPP_INFO(
         logger,
-        "%zu virtual gates: a crossing passes inside max(|u|, |v|) < %.3f m "
-        "(race.virtual_half_m), one outside is no pass and no miss", virtual_gates,
-        *config.virtual_half_m);
+        "%zu of %zu gates virtual (course.gates_virtual): a crossing outside its window is no "
+        "pass and no miss, the gate stays the target", virtual_gates, course.size());
     }
     if (config.type == MissionType::Race && config.stopCheck()) {
       char stop[96];
@@ -923,6 +996,11 @@ diagnostic_msgs::msg::DiagnosticStatus Plugin::statusMessage() const
       "last_crossing_vertical_m", text(crossing.available ? crossing.crossing.vertical : nan)));
   msg.values.push_back(keyValue("last_crossing_passed", text(crossing.passed)));
   msg.values.push_back(keyValue("last_crossing_valid", text(crossing.valid)));
+  msg.values.push_back(
+    keyValue(
+      "last_crossing_virtual",
+      text(crossing.available && mission_->sequencer().course().gate(crossing.gate).is_virtual)));
+  msg.values.push_back(keyValue("pass_tolerance_m", text(config.pass_tolerance_m)));
   msg.values.push_back(keyValue("valid_half_m", text(config.valid_half_m)));
   msg.values.push_back(keyValue("exit_reason", toString(status.exit_reason)));
   if (config.stopCheck()) {

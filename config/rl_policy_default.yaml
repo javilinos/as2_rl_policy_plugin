@@ -17,7 +17,7 @@
       motor_speed:
         topic: sensor_measurements/motor_angular_speed # sensor_msgs/JointState, velocity in rad/s in the policy's motor order
         timeout_s: 0.1
-      course: # timed gates in pass order, world ENU, yaw in rad
+      course: # timed gates in pass order, world ENU, yaw in rad; optional gates_shape (0 square, 1 octagon) and gates_virtual (true: nothing to hit)
         gates_x: [12.5, 6.5]
         gates_y: [2.0, 6.0]
         gates_z: [1.45, 1.45]
@@ -26,8 +26,8 @@
         bounds_y: [1.0, 32.0]
       race:
         laps: 3
-        pass_tolerance_m: 0.9
-        valid_half_m: 0.4 # reported in the status only
+        pass_tolerance_m: 0.9 # a square gate's pass window, physical or virtual: its real half-opening
+        valid_half_m: 0.4 # the policy's training window, logged only
         gate_timeout_s: 5.0
         bounds_margin_m: 0.5
         ceiling_m: 10.0

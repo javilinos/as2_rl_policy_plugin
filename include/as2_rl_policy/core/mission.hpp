@@ -106,13 +106,14 @@ struct MissionConfig
   std::vector<Gate> gates;
   Bounds bounds;
   int laps = 0;
+  // The pass windows, virtual gates alike; the valid windows are logged only.
   double pass_tolerance_m = 0.0;
   double valid_half_m = 0.0;
   // Unset, the square's values.
   std::optional<double> octagon_pass_tolerance_m;
   std::optional<double> octagon_valid_half_m;
-  // Required when a gate is virtual.
-  std::optional<double> virtual_half_m;
+  // Unset, a virtual gate's valid window is its shape's.
+  std::optional<double> virtual_valid_half_m;
   double gate_timeout_s = 0.0;
   double bounds_margin_m = 0.0;
   double ceiling_m = 0.0;
@@ -183,9 +184,12 @@ struct MissionEvent
   int gates_passed = 0;
   Crossing crossing;
   bool valid = false;
+  // GatePassed and GateOutside: the gate has nothing to hit.
+  bool is_virtual = false;
+  GateShape shape = GateShape::Square;
   double since_pass_s = 0.0;
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
-  // GateOutside: the window the crossing missed.
+  // GateOutside: the pass window the crossing missed.
   double window_m = 0.0;
   // OutOfBounds: which test was outside; the predicted stop only with the stop check on.
   bool position_outside = false;

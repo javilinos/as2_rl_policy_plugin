@@ -23,7 +23,7 @@ struct Crossing
 Crossing planeCrossing(
   const Eigen::Vector3d & previous, const Eigen::Vector3d & current, const Gate & gate);
 
-// max(|lateral|, |vertical|), a virtual gate's too; an octagon's also takes (|u| + |v|) / sqrt(2).
+// max(|lateral|, |vertical|); an octagon's also takes (|u| + |v|) / sqrt(2).
 double openingNorm(GateShape shape, double lateral, double vertical);
 
 const char * toString(GateShape shape);
@@ -31,22 +31,28 @@ const char * toString(GateShape shape);
 // How many of the course's gates have this shape.
 std::size_t countShape(const Course & course, GateShape shape);
 
+// How many of the course's gates are virtual.
+std::size_t countVirtual(const Course & course);
+
 struct SequencerConfig
 {
   int laps = 0;
+  // The pass windows, a shape's for every gate of it, virtual or not.
   double pass_tolerance_m = 0.0;
   double valid_half_m = 0.0;
   double gate_timeout_s = 0.0;
   double dt = 0.0;
-  // Unset, an octagon is held to the square's tolerance and window, in its own norm.
+  // Unset, an octagon is held to the square's window and valid window, in its own norm.
   std::optional<double> octagon_pass_tolerance_m;
   std::optional<double> octagon_valid_half_m;
-  // A virtual gate's pass and valid window both; required once the course has a virtual gate.
-  std::optional<double> virtual_half_m;
+  // A virtual gate's valid window, logged only; unset, its shape's.
+  std::optional<double> virtual_valid_half_m;
 
   double passTolerance(GateShape shape) const;
 
   double validHalf(GateShape shape) const;
+
+  double validHalf(const Gate & gate) const;
 };
 
 enum class GateEvent
@@ -56,7 +62,8 @@ enum class GateEvent
   Finished,
   Missed,
   Timeout,
-  // A virtual gate's plane crossed at or outside its window: no pass, no miss, the target stays.
+  // A virtual gate's plane crossed at or outside its pass window: no pass, no miss, the target
+  // stays.
   Outside,
 };
 
@@ -66,6 +73,7 @@ struct GateUpdate
   // The gate this update was checked against.
   std::size_t gate = 0;
   Crossing crossing;
+  // Inside the valid window: logged, never what decides a pass.
   bool valid = false;
 };
 

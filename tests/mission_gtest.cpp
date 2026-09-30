@@ -847,9 +847,9 @@ TEST_F(Mission, HoldReferenceIsSentOrConfiguredOrConfigured) {
 TEST_F(Mission, AVirtualGateCrossedOutsideItsWindowIsNoPassAndNoMiss) {
   MissionConfig virtuals = config();
   for (rl_policy::Gate & gate : virtuals.gates) {
-    gate.shape = GateShape::Virtual;
+    gate.is_virtual = true;
   }
-  virtuals.virtual_half_m = 0.5;
+  virtuals.pass_tolerance_m = 0.5;
   MissionController mission(virtuals, bank());
   mission.start();
   mission.takeEvents();
@@ -870,11 +870,12 @@ TEST_F(Mission, AVirtualGateCrossedOutsideItsWindowIsNoPassAndNoMiss) {
   ASSERT_EQ(events.size(), 1u);
   EXPECT_EQ(events[0].type, MissionEvent::Type::GateOutside);
   EXPECT_EQ(events[0].gate, 0u);
+  EXPECT_TRUE(events[0].is_virtual);
   EXPECT_DOUBLE_EQ(events[0].window_m, 0.5);
   EXPECT_EQ(
     rl_policy::describe(events[0]),
-    "Gate 0 crossed outside its virtual window: lateral 0.700 m, vertical 0.000 m, not inside "
-    "0.500 m; no pass, gate 0 stays the target");
+    "Gate 0 (virtual square) crossed outside its window: lateral 0.700 m, vertical 0.000 m, not "
+    "inside 0.500 m; no pass and no miss, gate 0 stays the target");
 
   // Round again, back behind the plane, and through the window.
   mission.step(at(4.8, 0.1, 1.5), 2 * kDt);
@@ -887,6 +888,60 @@ TEST_F(Mission, AVirtualGateCrossedOutsideItsWindowIsNoPassAndNoMiss) {
   events = mission.takeEvents();
   ASSERT_EQ(events.size(), 1u);
   EXPECT_EQ(events[0].type, MissionEvent::Type::GatePassed);
+  EXPECT_EQ(
+    rl_policy::describe(events[0]),
+    "Gate 0 passed (virtual): lateral 0.100 m, vertical 0.000 m, valid; 1 gates passed, 0 laps "
+    "completed");
+}
+
+TEST_F(Mission, APhysicalGateCrossedOutsideTheSameWindowIsAMiss) {
+  MissionConfig physical = config();
+  physical.pass_tolerance_m = 0.5;
+  physical.gates[1].is_virtual = true;
+  MissionController mission(physical, bank());
+  mission.start();
+  mission.step(at(4.8, 0.7, 1.5), 0.0);
+  mission.step(at(5.2, 0.7, 1.5), kDt);
+  EXPECT_EQ(mission.phase(), Phase::Hold);
+  EXPECT_EQ(mission.status().exit_reason, ExitReason::Missed);
+  EXPECT_EQ(mission.status().gates_passed, 0);
+}
+
+TEST_F(Mission, AVirtualGatePassesInsideItsShapesWindowAndLogsItsOwnValidWindow) {
+  MissionConfig virtuals = config();
+  for (rl_policy::Gate & gate : virtuals.gates) {
+    gate.is_virtual = true;
+  }
+  virtuals.gates[1].shape = GateShape::Octagon;
+  virtuals.pass_tolerance_m = 0.75;
+  virtuals.octagon_pass_tolerance_m = 0.8;
+  virtuals.virtual_valid_half_m = 0.5;
+  MissionController mission(virtuals, bank());
+  mission.start();
+  mission.takeEvents();
+  // Wide of the 0.5 m the policy trained on, inside the 0.75 m of the gate.
+  mission.step(at(4.8, 0.7, 1.5), 0.0);
+  const StepResult first = mission.step(at(5.2, 0.7, 1.5), kDt);
+  EXPECT_EQ(first.status.gates_passed, 1);
+  EXPECT_TRUE(first.status.last_crossing.passed);
+  EXPECT_FALSE(first.status.last_crossing.valid);
+  auto events = mission.takeEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].type, MissionEvent::Type::GatePassed);
+  EXPECT_EQ(
+    rl_policy::describe(events[0]),
+    "Gate 0 passed (virtual): lateral 0.700 m, vertical 0.000 m, outside the valid opening; 1 "
+    "gates passed, 0 laps completed");
+  // The octagon's corner: inside its 0.8 m apothem on each axis, outside its norm.
+  mission.step(at(9.8, 0.6, 2.1), 2 * kDt);
+  const StepResult corner = mission.step(at(10.2, 0.6, 2.1), 3 * kDt);
+  EXPECT_EQ(corner.status.target, 1);
+  EXPECT_FALSE(corner.status.last_crossing.passed);
+  events = mission.takeEvents();
+  ASSERT_EQ(events.size(), 1u);
+  EXPECT_EQ(events[0].type, MissionEvent::Type::GateOutside);
+  EXPECT_EQ(events[0].shape, GateShape::Octagon);
+  EXPECT_DOUBLE_EQ(events[0].window_m, 0.8);
 }
 
 TEST_F(Mission, TheVirtualFixtureSequenceFliesThroughTheMission) {
@@ -894,9 +949,9 @@ TEST_F(Mission, TheVirtualFixtureSequenceFliesThroughTheMission) {
   MissionConfig virtuals = config(MissionType::Race, fixture["sequence"]["laps"].as<int>());
   virtuals.gates = rl_policy_test::courseGates(fixture["course"]);
   for (rl_policy::Gate & gate : virtuals.gates) {
-    gate.shape = GateShape::Virtual;
+    gate.is_virtual = true;
   }
-  virtuals.virtual_half_m = fixture["virtual_half_m"].as<double>();
+  virtuals.pass_tolerance_m = fixture["pass_tolerance_m"].as<double>();
   MissionController mission(virtuals, bank());
   mission.start();
   const YAML::Node positions = fixture["sequence"]["positions"];
@@ -927,24 +982,28 @@ TEST_F(Mission, TheVirtualFixtureSequenceFliesThroughTheMission) {
   EXPECT_GE(outside, 3);
 }
 
-TEST_F(Mission, AVirtualCourseNeedsItsWindow) {
+TEST_F(Mission, AVirtualCourseNeedsNoKeyOfItsOwnAndItsValidWindowMustBeOne) {
   MissionConfig virtuals = config();
-  virtuals.gates[1].shape = GateShape::Virtual;
-  EXPECT_THROW(MissionController(virtuals, bank()), std::invalid_argument);
-  try {
-    MissionController mission(virtuals, bank());
-  } catch (const std::invalid_argument & e) {
-    EXPECT_NE(std::string(e.what()).find("race.virtual_half_m"), std::string::npos);
-  }
-  EXPECT_THROW(MissionController(virtuals, bank(false, true)), std::invalid_argument);
+  virtuals.gates[1].is_virtual = true;
+  MissionController plain(virtuals, bank());
+  EXPECT_FALSE(plain.sequencer().config().virtual_valid_half_m.has_value());
+  EXPECT_TRUE(plain.sequencer().course().gate(1).is_virtual);
+  EXPECT_EQ(plain.sequencer().course().gate(1).shape, GateShape::Square);
   for (const double bad : {0.0, -0.4, std::numeric_limits<double>::quiet_NaN()}) {
-    virtuals.virtual_half_m = bad;
+    virtuals.virtual_valid_half_m = bad;
     EXPECT_THROW(MissionController(virtuals, bank()), std::invalid_argument) << bad;
+    try {
+      MissionController mission(virtuals, bank());
+    } catch (const std::invalid_argument & e) {
+      EXPECT_NE(std::string(e.what()).find("race.virtual_valid_half_m"), std::string::npos);
+    }
   }
-  virtuals.virtual_half_m = 0.5;
+  virtuals.virtual_valid_half_m = 0.5;
   MissionController mission(virtuals, bank());
-  EXPECT_DOUBLE_EQ(*mission.sequencer().config().virtual_half_m, 0.5);
-  EXPECT_EQ(mission.sequencer().course().gate(1).shape, GateShape::Virtual);
+  EXPECT_DOUBLE_EQ(*mission.sequencer().config().virtual_valid_half_m, 0.5);
+  const rl_policy::SequencerConfig & windows = mission.sequencer().config();
+  EXPECT_DOUBLE_EQ(windows.validHalf(mission.sequencer().course().gate(1)), 0.5);
+  EXPECT_DOUBLE_EQ(windows.validHalf(mission.sequencer().course().gate(0)), 0.4);
 }
 
 TEST_F(Mission, ThePredictedStop) {

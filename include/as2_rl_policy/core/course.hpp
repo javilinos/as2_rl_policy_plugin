@@ -10,12 +10,11 @@
 namespace rl_policy
 {
 
-// An octagon has its flats on the gate's lateral and vertical axes; a virtual gate has no frame.
+// The opening's geometry; an octagon has its flats on the gate's lateral and vertical axes.
 enum class GateShape
 {
   Square = 0,
   Octagon = 1,
-  Virtual = 2,
 };
 
 struct Gate
@@ -23,6 +22,8 @@ struct Gate
   Eigen::Vector3d position = Eigen::Vector3d::Zero();
   double yaw = 0.0;
   GateShape shape = GateShape::Square;
+  // Nothing stands there to hit: a crossing outside the window is no pass and no miss.
+  bool is_virtual = false;
 };
 
 struct Bounds
