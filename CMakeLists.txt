@@ -44,6 +44,7 @@ add_library(${PROJECT_NAME}_core SHARED
   src/core/mission.cpp
   src/core/observation.cpp
   src/core/policy.cpp
+  src/core/race_pilot_course.cpp
 )
 target_include_directories(${PROJECT_NAME}_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

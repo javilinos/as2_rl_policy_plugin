@@ -601,3 +601,22 @@ TEST(VirtualGate, ItsValidWindowIsItsShapesUnlessGivenAndMustBeAWindow) {
   EXPECT_STREQ(rl_policy::toString(GateShape::Square), "square");
   EXPECT_STREQ(rl_policy::toString(GateShape::Octagon), "octagon");
 }
+
+TEST(Sequencer, TotalCrossingsFinishOnTheLastOneNotOnTheLaps) {
+  const std::size_t n = seasonTwo().size();
+  rl_policy::SequencerConfig config = sequencerConfig(2);
+  config.total_crossings = static_cast<int>(2 * n + 1);
+  GateSequencer sequencer(seasonTwo(), config);
+  for (std::size_t pass = 0; pass < 2 * n + 1; ++pass) {
+    const rl_policy::GateUpdate update = passTarget(sequencer, 0.0, 0.0);
+    EXPECT_EQ(update.event, pass + 1 == 2 * n + 1 ? GateEvent::Finished : GateEvent::Passed)
+      << "pass " << pass;
+  }
+  EXPECT_TRUE(sequencer.finished());
+  EXPECT_EQ(sequencer.lap(), 2);
+  EXPECT_EQ(sequencer.gatesPassed(), static_cast<int>(2 * n + 1));
+  EXPECT_EQ(sequencer.target(), 1u);
+
+  config.total_crossings = 0;
+  EXPECT_THROW(GateSequencer(seasonTwo(), config), std::invalid_argument);
+}

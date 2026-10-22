@@ -7,9 +7,12 @@
 #include <cstddef>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "as2_rl_policy/core/course.hpp"
 
 namespace rl_policy
 {
@@ -49,6 +52,15 @@ struct PolicySource
   std::string quadlab_commit;
 };
 
+// The circuit a race policy trained on: one lap of crossings in the order flown.
+struct TrainedCourse
+{
+  std::string track_id;
+  int laps = 0;
+  std::vector<std::string> names;
+  std::vector<Gate> gates;
+};
+
 struct PolicySpec
 {
   std::string file;
@@ -57,6 +69,8 @@ struct PolicySpec
   ActionSpec action;
   ObservationSpec observation;
   PolicySource source;
+  // The file's optional course block.
+  std::optional<TrainedCourse> course;
 };
 
 class PolicyError : public std::runtime_error

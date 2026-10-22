@@ -47,6 +47,8 @@ struct SequencerConfig
   std::optional<double> octagon_valid_half_m;
   // A virtual gate's valid window, logged only; unset, its shape's.
   std::optional<double> virtual_valid_half_m;
+  // Set, the race finishes on this many passes rather than on its last lap: a sent course's.
+  std::optional<int> total_crossings;
 
   double passTolerance(GateShape shape) const;
 

@@ -90,6 +90,30 @@ warning, empty courses are ignored, and the setpoint stays. A mode set keeps the
 request holds where it was made. The controller manager passes references on only once a
 control mode is set, so the course has to arrive (or keep arriving) after `set_control_mode`.
 
+## Course from the race pilot
+
+With `course.source: race_pilot` the race mission flies the course as2_race_pilot sends on
+`motion_reference/trajectory`, the message the MPCC flies, instead of `course.gates_*`. It reads
+the crossings alone: the points whose id carries the `_gp` mark, each a gate at its `position`
+crossed along its `yaw_angle`. The gate's name is the id without its marks (`_gp _ny _rt _ls _sy
+_vn`) and lap tag (`_lap2`); it is virtual when it contains `_v` and an octagon when it ends in
+`_oct`, as the rest of the stack names them. Everything else the MPCC is told, pass-through
+points, heading and speed marks and the end point, is ignored. The crossings repeat with one
+lap's period, and the race finishes on the LAST crossing sent: a closed circuit's closing first
+gate is raced (2 laps of 4 and gate01, 9 passes).
+
+Before the race can start, one lap must match `course.gates_*`, the circuit the race policy
+trained on, gate by gate: the same count and order, positions within `course.match_position_m`,
+yaw within `course.match_yaw_deg`, the same virtual flag and shape. A course that does not match
+is refused at ERROR level with the first gate that differs, and no command is computed until one
+that matches arrives; the status says `course: refused: ...`. One that matches is raced with the
+sent gates' poses (`course: matched`, `course_crossings`). A republish changes nothing, and a
+different course once the race has started is ignored with a warning.
+
+A policy file may carry the circuit it trained on, a `course` block of one lap of crossings
+(`{name, position, yaw, virtual, shape}`). A race policy that does refuses any `course.gates_*`
+but its own, whatever the source.
+
 ## Run
 
 The launch file layers the node's parameters, each over the one before: as2_motion_controller's

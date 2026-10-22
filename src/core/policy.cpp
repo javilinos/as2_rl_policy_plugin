@@ -110,6 +110,55 @@ void expectString(
   }
 }
 
+// The optional course block: one lap of crossings, each {name, position, yaw, virtual, shape}.
+std::optional<TrainedCourse> parseCourse(const YAML::Node & node)
+{
+  if (!node.IsDefined() || node.IsNull()) {
+    return std::nullopt;
+  }
+  if (!node.IsMap()) {
+    throw PolicyError("'course' is not a mapping");
+  }
+  TrainedCourse course;
+  course.track_id = optionalString(node, "track_id", "unknown");
+  const YAML::Node laps = node["laps"];
+  if (laps.IsDefined() && !laps.IsNull()) {
+    course.laps = scalar<int>(laps, "course.laps", "integer");
+  }
+  const YAML::Node gates = required(node, "gates", "course");
+  if (!gates.IsSequence() || gates.size() == 0) {
+    throw PolicyError("'course.gates' must be a non-empty sequence");
+  }
+  for (std::size_t i = 0; i < gates.size(); ++i) {
+    const std::string path = "course.gates[" + std::to_string(i) + "]";
+    const YAML::Node entry = gates[i];
+    course.names.push_back(
+      scalar<std::string>(required(entry, "name", path), path + ".name", "string"));
+    const std::vector<double> position =
+      doubles(required(entry, "position", path), path + ".position");
+    if (position.size() != 3) {
+      throw PolicyError("'" + path + ".position' must hold 3 values");
+    }
+    Gate gate;
+    gate.position = Eigen::Vector3d(position[0], position[1], position[2]);
+    gate.yaw = finiteDouble(required(entry, "yaw", path), path + ".yaw");
+    const YAML::Node is_virtual = entry["virtual"];
+    if (is_virtual.IsDefined() && !is_virtual.IsNull()) {
+      gate.is_virtual = scalar<bool>(is_virtual, path + ".virtual", "boolean");
+    }
+    const std::string shape = optionalString(entry, "shape", "square");
+    if (shape == "square") {
+      gate.shape = GateShape::Square;
+    } else if (shape == "octagon") {
+      gate.shape = GateShape::Octagon;
+    } else {
+      throw PolicyError("'" + path + ".shape' is '" + shape + "': square or octagon");
+    }
+    course.gates.push_back(gate);
+  }
+  return course;
+}
+
 // Weights are float32 values; parsing them as float keeps exactly the network that was trained.
 double float32(double value)
 {
@@ -317,6 +366,7 @@ std::shared_ptr<MlpPolicy> MlpPolicy::load(const std::string & path)
     spec.source.env_config = optionalString(source, "env_config", "unknown");
     spec.source.plant_config = optionalString(source, "plant_config", "unknown");
     spec.source.quadlab_commit = optionalString(source, "quadlab_commit", "unknown");
+    spec.course = parseCourse(root["course"]);
     const int dim = spec.observation.dim;
     auto policy = std::make_shared<MlpPolicy>(std::move(spec), std::move(layers));
 

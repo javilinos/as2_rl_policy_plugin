@@ -206,6 +206,43 @@ TEST(PolicyFile, TaskDefaultsToRace) {
   EXPECT_EQ(policy->spec().task, "race");
 }
 
+TEST(PolicyFile, ReadsTheCircuitItTrainedOnWhenItHasOne) {
+  EXPECT_FALSE(MlpPolicy::load(fixturePath(kPolicyFixture))->spec().course.has_value());
+
+  YAML::Node node = policyYaml();
+  node["course"] = YAML::Load(
+    "{track_id: fronton_s3_v3, laps: 2, gates: ["
+    "{name: gate01, position: [4.5, 0.0, 1.45], yaw: 0.0, virtual: false, shape: square},"
+    "{name: gate03_fake_v, position: [4.5, -14.0, 1.45], yaw: 3.14159, virtual: true},"
+    "{name: gate05_oct, position: [1.0, 2.0, 3.0], yaw: -1.5708, shape: octagon}]}");
+  const auto policy = MlpPolicy::load(writeYaml(node, "policy_course"));
+  ASSERT_TRUE(policy->spec().course.has_value());
+  const rl_policy::TrainedCourse & course = *policy->spec().course;
+  EXPECT_EQ(course.track_id, "fronton_s3_v3");
+  EXPECT_EQ(course.laps, 2);
+  ASSERT_EQ(course.gates.size(), 3u);
+  EXPECT_EQ(course.names[1], "gate03_fake_v");
+  EXPECT_EQ(course.gates[1].position, Eigen::Vector3d(4.5, -14.0, 1.45));
+  EXPECT_DOUBLE_EQ(course.gates[1].yaw, 3.14159);
+  EXPECT_TRUE(course.gates[1].is_virtual);
+  EXPECT_FALSE(course.gates[0].is_virtual);
+  EXPECT_EQ(course.gates[0].shape, rl_policy::GateShape::Square);
+  EXPECT_EQ(course.gates[2].shape, rl_policy::GateShape::Octagon);
+}
+
+TEST(PolicyFile, RefusesAMalformedCourse) {
+  YAML::Node node = policyYaml();
+  node["course"] = YAML::Load("{gates: []}");
+  EXPECT_NE(refusal(node).find("course.gates"), std::string::npos);
+  node["course"] = YAML::Load("{gates: [{name: gate01, yaw: 0.0}]}");
+  EXPECT_NE(refusal(node).find("course.gates[0].position"), std::string::npos);
+  node["course"] = YAML::Load("{gates: [{name: gate01, position: [1.0, 2.0], yaw: 0.0}]}");
+  EXPECT_NE(refusal(node).find("course.gates[0].position"), std::string::npos);
+  node["course"] = YAML::Load(
+    "{gates: [{name: gate01, position: [1.0, 2.0, 3.0], yaw: 0.0, shape: round}]}");
+  EXPECT_NE(refusal(node).find("course.gates[0].shape"), std::string::npos);
+}
+
 TEST(PolicyBank, SharesOneDt) {
   const std::string file = fixturePath(kPolicyFixture);
   const PolicyBank bank = PolicyBank::load({"race", "hover"}, {file, file});

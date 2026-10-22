@@ -96,6 +96,9 @@ private:
 
   void motorSpeedCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
 
+  // course.source race_pilot: the race's course from as2_race_pilot's trajectory, while idle.
+  void takeRacePilotCourse(const as2_msgs::msg::TrajectorySetpoints & ref);
+
   void handleMissionEvents();
 
   void writeCommand(
@@ -137,6 +140,10 @@ private:
   // Armed by reset(): the next pose reference in a HOVER mode is the hold setpoint.
   bool hover_reference_armed_ = false;
   bool mode_set_pending_ = false;
+
+  // The last course the race pilot sent, which it republishes unchanged.
+  std::vector<Waypoint> sent_waypoints_;
+  std::string course_state_ = "configured";
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr motor_speed_sub_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr status_pub_;

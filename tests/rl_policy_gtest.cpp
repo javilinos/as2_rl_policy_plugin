@@ -104,6 +104,40 @@ as2_msgs::msg::TrajectorySetpoints courseEndingAt(
   return course(frame_id, {{14.5, 2.0, 0.2, 0.0}, {12.5, 2.0, 1.45, 3.14}, {x, y, z, yaw}});
 }
 
+// The season 2 course as as2_race_pilot sends it: the vehicle, laps times the gates with their
+// crossing marks, the closing first gate and the end point; `shift` moves gate 1 along x.
+as2_msgs::msg::TrajectorySetpoints sentSeasonTwo(int laps, double shift = 0.0)
+{
+  const YAML::Node season = rl_policy_test::loadFixture("obs_season2.yaml")["course"];
+  const std::vector<double> xs = rl_policy_test::doubles(season["gates_x"]);
+  const std::vector<double> ys = rl_policy_test::doubles(season["gates_y"]);
+  const std::vector<double> zs = rl_policy_test::doubles(season["gates_z"]);
+  const std::vector<double> yaws = rl_policy_test::doubles(season["gates_yaw"]);
+  as2_msgs::msg::TrajectorySetpoints msg;
+  msg.header.frame_id = "earth";
+  const auto add = [&msg](const std::string & id, double x, double y, double z, double yaw) {
+      as2_msgs::msg::TrajectoryPoint point;
+      point.id = id;
+      point.position.x = x;
+      point.position.y = y;
+      point.position.z = z;
+      point.yaw_angle = yaw;
+      msg.setpoints.push_back(point);
+    };
+  add("vehicle_ny", 14.5, 2.0, 0.2, 0.0);
+  for (int lap = 0; lap < laps; ++lap) {
+    const std::string tag = lap == 0 ? "" : "_lap" + std::to_string(lap + 1);
+    for (std::size_t i = 0; i < xs.size(); ++i) {
+      add(
+        "gate" + std::to_string(i) + tag + "_gp_vn", xs[i] + (i == 1 ? shift : 0.0), ys[i], zs[i],
+        yaws[i]);
+    }
+  }
+  add("gate0_lap" + std::to_string(laps) + "_gp_vn", xs[0], ys[0], zs[0], yaws[0]);
+  add("end", 10.0, 2.0, 1.45, 0.0);
+  return msg;
+}
+
 ControlMode controlMode(int8_t control_mode, int8_t yaw_mode)
 {
   ControlMode mode;
@@ -1084,6 +1118,47 @@ TEST_F(PluginTest, AHoverRequestHoldsWhereItWasMadeWhateverTheReferences) {
   plugin_->updateReference(courseEndingAt("earth", 10.0, 5.0, 1.8, 0.5));
   expectSetpoint(10.0, 5.0, 1.8, 0.5, SetpointSource::Sent);
   EXPECT_EQ(plugin_->mission()->phase(), Phase::Hold);
+}
+
+TEST_F(PluginTest, ARacePilotCourseIsRacedOnceALapMatchesTheConfiguredGates) {
+  build(
+    with(
+      flightParameters(rl_policy_test::fixturePath(kPolicyFixture)),
+      rclcpp::Parameter("rl_policy.course.source", std::string("race_pilot"))));
+  ASSERT_TRUE(plugin_->isReady());
+  setTime(10.0);
+  setTrajectoryMode(pose(14.5, 2.0, 0.2, 3.14));
+
+  // No course yet: no command.
+  publishMotorSpeeds(1500.0);
+  spin();
+  EXPECT_FALSE(computeOutput());
+  EXPECT_EQ(plugin_->mission()->phase(), Phase::Idle);
+
+  // A course whose gate 1 moved is refused, and the race still waits.
+  plugin_->updateReference(sentSeasonTwo(2, 0.5));
+  EXPECT_FALSE(plugin_->mission()->courseReady());
+  EXPECT_FALSE(computeOutput());
+
+  // The configured gates' course is raced, to its closing crossing: 2 laps of 12 and gate 0.
+  plugin_->updateReference(sentSeasonTwo(2));
+  ASSERT_TRUE(plugin_->mission()->courseReady());
+  ASSERT_TRUE(firstStep());
+  EXPECT_EQ(plugin_->mission()->phase(), Phase::Race);
+  EXPECT_EQ(plugin_->mission()->sequencer().config().total_crossings.value_or(-1), 25);
+
+  // Another course while racing changes nothing.
+  plugin_->updateReference(sentSeasonTwo(3));
+  EXPECT_EQ(plugin_->mission()->sequencer().config().total_crossings.value_or(-1), 25);
+
+  statuses_.clear();
+  setTime(10.25);
+  spin(std::chrono::milliseconds(300));
+  ASSERT_FALSE(statuses_.empty());
+  auto status = values(statuses_.back());
+  EXPECT_EQ(status["course_source"], "race_pilot");
+  EXPECT_EQ(status["course"], "matched");
+  EXPECT_EQ(status["course_crossings"], "25");
 }
 
 int main(int argc, char ** argv)

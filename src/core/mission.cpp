@@ -124,6 +124,29 @@ const char * toString(SetpointSource source)
   return "unknown";
 }
 
+const char * toString(CourseSource source)
+{
+  switch (source) {
+    case CourseSource::Configured:
+      return "configured";
+    case CourseSource::RacePilot:
+      return "race_pilot";
+  }
+  return "unknown";
+}
+
+CourseSource courseSourceFromString(const std::string & name)
+{
+  if (name == toString(CourseSource::Configured)) {
+    return CourseSource::Configured;
+  }
+  if (name == toString(CourseSource::RacePilot)) {
+    return CourseSource::RacePilot;
+  }
+  throw std::invalid_argument(
+          "course source '" + name + "' is neither 'configured' nor 'race_pilot'");
+}
+
 MissionType missionTypeFromString(const std::string & name)
 {
   if (name == toString(MissionType::Race)) {
@@ -287,17 +310,37 @@ MissionConfig MissionController::validated(MissionConfig config, const PolicyBan
   require(std::isfinite(config.min_altitude_m), "hold.min_altitude_m must be finite");
   require(
     config.mass_kg > 0.0 && std::isfinite(config.mass_kg), "vehicle.mass_kg must be positive");
+  require(
+    std::isfinite(config.match_position_m) && config.match_position_m > 0.0 &&
+    std::isfinite(config.match_yaw_rad) && config.match_yaw_rad > 0.0,
+    "course.match_position_m and course.match_yaw_deg must be finite and positive");
+  if (config.type == MissionType::Race) {
+    // A race policy that names its circuit flies no other.
+    const auto & trained = policies.get(kRacePolicy)->spec().course;
+    if (trained) {
+      const CourseMatch match = matchCourse(
+        config.gates, {}, trained->gates, config.match_position_m, config.match_yaw_rad);
+      require(
+        match.matches, "course.gates_* is not the circuit the race policy trained on (" +
+        trained->track_id + "): " + match.reason);
+    }
+  }
   return config;
+}
+
+SequencerConfig MissionController::sequencerConfig(std::optional<int> total_crossings) const
+{
+  SequencerConfig sequencer{config_.laps, config_.pass_tolerance_m, config_.valid_half_m,
+    config_.gate_timeout_s, policies_.dt(), config_.octagon_pass_tolerance_m,
+    config_.octagon_valid_half_m, config_.virtual_valid_half_m};
+  sequencer.total_crossings = total_crossings;
+  return sequencer;
 }
 
 MissionController::MissionController(MissionConfig config, PolicyBank policies)
 : config_(validated(std::move(config), policies)),
   policies_(std::move(policies)),
-  sequencer_(
-    Course(config_.gates, config_.bounds),
-    SequencerConfig{config_.laps, config_.pass_tolerance_m, config_.valid_half_m,
-      config_.gate_timeout_s, policies_.dt(), config_.octagon_pass_tolerance_m,
-      config_.octagon_valid_half_m, config_.virtual_valid_half_m}),
+  sequencer_(Course(config_.gates, config_.bounds), sequencerConfig(std::nullopt)),
   hold_course_(Course::single(config_.hold_setpoint))
 {
   if (config_.type == MissionType::Hover) {
@@ -308,9 +351,40 @@ MissionController::MissionController(MissionConfig config, PolicyBank policies)
   }
 }
 
+bool MissionController::courseReady() const
+{
+  return config_.type != MissionType::Race || config_.course_source == CourseSource::Configured ||
+         sent_course_.has_value();
+}
+
+CourseMatch MissionController::takeSentCourse(const SentCourse & course)
+{
+  CourseMatch match;
+  if (status_.phase != Phase::Idle || config_.type != MissionType::Race ||
+    config_.course_source != CourseSource::RacePilot)
+  {
+    match.reason = "a sent course is only taken by an idle race mission on course.source race_pilot";
+    return match;
+  }
+  match = matchCourse(
+    course.lap(), course.lapNames(), config_.gates, config_.match_position_m,
+    config_.match_yaw_rad);
+  last_match_ = match;
+  if (!match.matches) {
+    sent_course_.reset();
+    sequencer_ = GateSequencer(Course(config_.gates, config_.bounds), sequencerConfig(std::nullopt));
+    return match;
+  }
+  sent_course_ = course;
+  sequencer_ = GateSequencer(
+    Course(course.lap(), config_.bounds),
+    sequencerConfig(static_cast<int>(course.crossings.size())));
+  return match;
+}
+
 bool MissionController::start()
 {
-  if (status_.phase != Phase::Idle) {
+  if (status_.phase != Phase::Idle || !courseReady()) {
     return false;
   }
   if (config_.type == MissionType::Hover) {

@@ -29,6 +29,9 @@ const std::vector<std::string> & optionalInitParameters()
   static const std::vector<std::string> tails = {
     "course.gates_shape",
     "course.gates_virtual",
+    "course.source",
+    "course.match_position_m",
+    "course.match_yaw_deg",
     "race.octagon_pass_tolerance_m",
     "race.octagon_valid_half_m",
     "race.virtual_valid_half_m",
@@ -327,6 +330,21 @@ void Plugin::readSettings(Settings & settings)
       mission.bounds.y_max = values[1];
     }
   }
+  if (const auto * p = optionalSetting("course.source", ParameterType::PARAMETER_STRING)) {
+    try {
+      mission.course_source = courseSourceFromString(p->as_string());
+    } catch (const std::invalid_argument & e) {
+      refuse(param("course.source") + ": " + e.what());
+    }
+  }
+  if (const auto * p =
+    optionalSetting("course.match_position_m", ParameterType::PARAMETER_DOUBLE))
+  {
+    mission.match_position_m = p->as_double();
+  }
+  if (const auto * p = optionalSetting("course.match_yaw_deg", ParameterType::PARAMETER_DOUBLE)) {
+    mission.match_yaw_rad = p->as_double() * kPi / 180.0;
+  }
 
   if (const auto * p = setting("race.laps", ParameterType::PARAMETER_INTEGER)) {
     mission.laps = static_cast<int>(std::clamp<int64_t>(
@@ -512,6 +530,23 @@ void Plugin::ownInitialize()
       "rl_policy ready: %s mission, %zu gates, %d laps, step %.4f s, motor speeds from '%s'",
       toString(config.type), config.gates.size(), config.laps, dt_,
       motor_speed_sub_->get_topic_name());
+    if (config.type == MissionType::Race && config.course_source == CourseSource::RacePilot) {
+      course_state_ = "waiting";
+      RCLCPP_INFO(
+        logger,
+        "Course from the race pilot (course.source): the race starts once a sent course's lap "
+        "matches the %zu gates of course.gates_*, %.3f m and %.1f deg (course.match_position_m, "
+        "course.match_yaw_deg), and finishes on its last crossing", config.gates.size(),
+        config.match_position_m, config.match_yaw_rad * 180.0 / kPi);
+    }
+    if (config.type == MissionType::Race) {
+      const auto & trained = mission_->policies().get(kRacePolicy)->spec().course;
+      if (trained) {
+        RCLCPP_INFO(
+          logger, "course.gates_* is the circuit the race policy trained on (%s)",
+          trained->track_id.c_str());
+      }
+    }
     const Course & course = mission_->sequencer().course();
     const SequencerConfig & windows = mission_->sequencer().config();
     const std::size_t octagons = countShape(course, GateShape::Octagon);
@@ -695,6 +730,10 @@ void Plugin::onUpdateReference(const as2_msgs::msg::TrajectorySetpoints & ref)
   const rclcpp::Logger logger = getNodePtr()->get_logger();
   const MissionConfig & config = mission_->config();
   if (config.type == MissionType::Race) {
+    if (config.course_source == CourseSource::RacePilot) {
+      takeRacePilotCourse(ref);
+      return;
+    }
     RCLCPP_INFO_ONCE(
       logger, "Trajectory references are ignored: the race mission flies the configured course");
     return;
@@ -743,6 +782,63 @@ void Plugin::onUpdateReference(const as2_msgs::msg::Thrust & ref)
   RCLCPP_INFO_ONCE(getNodePtr()->get_logger(), "Thrust references are ignored");
 }
 
+void Plugin::takeRacePilotCourse(const as2_msgs::msg::TrajectorySetpoints & ref)
+{
+  const rclcpp::Logger logger = getNodePtr()->get_logger();
+  auto & clock = *getNodePtr()->get_clock();
+  const std::string & frame = ref.header.frame_id;
+  const std::string bare = !frame.empty() && frame.front() == '/' ? frame.substr(1) : frame;
+  if (!frame.empty() && bare != getDesiredPoseFrameId()) {
+    RCLCPP_WARN_THROTTLE(
+      logger, clock, 5000, "Course from the race pilot in frame '%s', the race is in '%s': ignored",
+      frame.c_str(), getDesiredPoseFrameId().c_str());
+    return;
+  }
+  std::vector<Waypoint> waypoints;
+  waypoints.reserve(ref.setpoints.size());
+  for (const as2_msgs::msg::TrajectoryPoint & point : ref.setpoints) {
+    waypoints.push_back(
+      Waypoint{point.id, Eigen::Vector3d(point.position.x, point.position.y, point.position.z),
+        static_cast<double>(point.yaw_angle)});
+  }
+  // The pilot republishes its course unchanged; only a new one is read.
+  if (waypoints == sent_waypoints_) {
+    return;
+  }
+  sent_waypoints_ = waypoints;
+  if (mission_->phase() != Phase::Idle) {
+    RCLCPP_WARN(
+      logger, "A new course from the race pilot in phase %s: ignored, the race carries on",
+      toString(mission_->phase()));
+    return;
+  }
+
+  try {
+    const SentCourse course = sentCourse(waypoints);
+    const CourseMatch match = mission_->takeSentCourse(course);
+    if (match.matches) {
+      course_state_ = "matched";
+      const std::string extra = course.extra > 0 ? " + " + std::to_string(course.extra) : "";
+      RCLCPP_INFO(
+        logger,
+        "Course from the race pilot: %zu crossings, %d laps of %zu gates%s, matches the trained "
+        "circuit within %.3f m and %.2f deg; %zu other waypoints ignored", course.crossings.size(),
+        course.laps, course.lap_size, extra.c_str(), match.max_position_error_m,
+        match.max_yaw_error_rad * 180.0 / kPi, course.ignored);
+    } else {
+      course_state_ = "refused: " + match.reason;
+      RCLCPP_ERROR(
+        logger, "Course from the race pilot refused, the race does not start: %s",
+        match.reason.c_str());
+    }
+  } catch (const std::invalid_argument & e) {
+    course_state_ = std::string("refused: ") + e.what();
+    RCLCPP_ERROR(
+      logger, "Course from the race pilot refused, the race does not start: %s", e.what());
+  }
+  publishStatus();
+}
+
 bool Plugin::computeOutput(
   double dt,
   geometry_msgs::msg::PoseStamped & pose,
@@ -769,6 +865,13 @@ bool Plugin::computeOutput(
   if (mission_->phase() == Phase::Idle && isHoverEnabled()) {
     RCLCPP_WARN_THROTTLE(
       logger, clock, 1000, "HOVER mode without a hold setpoint yet, no command computed");
+    return false;
+  }
+  if (mission_->phase() == Phase::Idle && !mission_->courseReady()) {
+    RCLCPP_WARN_THROTTLE(
+      logger, clock, 1000,
+      "No course from the race pilot that matches the trained circuit yet (%s), no command "
+      "computed", course_state_.c_str());
     return false;
   }
 
@@ -983,6 +1086,11 @@ diagnostic_msgs::msg::DiagnosticStatus Plugin::statusMessage() const
   msg.values.push_back(keyValue("target", std::to_string(status.target)));
   msg.values.push_back(keyValue("lap", std::to_string(status.lap)));
   msg.values.push_back(keyValue("laps", std::to_string(config.laps)));
+  msg.values.push_back(keyValue("course_source", toString(config.course_source)));
+  msg.values.push_back(keyValue("course", course_state_));
+  if (const auto & sent = mission_->sentCourse()) {
+    msg.values.push_back(keyValue("course_crossings", std::to_string(sent->crossings.size())));
+  }
   msg.values.push_back(keyValue("gates_passed", std::to_string(status.gates_passed)));
   msg.values.push_back(
     keyValue(

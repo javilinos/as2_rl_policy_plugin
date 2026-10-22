@@ -66,12 +66,35 @@ public:
 
   std::size_t calls() const {return observations.size();}
 
+  // The circuit its policy file says it trained on.
+  void trainOn(const rl_policy::TrainedCourse & course) {spec_.course = course;}
+
   mutable std::vector<Eigen::VectorXd> observations;
 
 private:
   rl_policy::PolicySpec spec_;
   double offset_;
 };
+
+// The fixture's three gates as as2_race_pilot sends them: laps times over, then the closing
+// first gate; `shift` moves the second gate along x.
+rl_policy::SentCourse sentThreeGates(int laps, double shift = 0.0)
+{
+  std::vector<rl_policy::Waypoint> points = {
+    {"vehicle_ny", Eigen::Vector3d(0.0, 0.0, 0.1), 0.0},
+    {"start_ny", Eigen::Vector3d(0.0, 0.0, 0.1), 0.0}};
+  for (int lap = 0; lap < laps; ++lap) {
+    const std::string tag = lap == 0 ? "" : "_lap" + std::to_string(lap + 1);
+    for (int i = 0; i < 3; ++i) {
+      points.push_back(
+        {"gate0" + std::to_string(i + 1) + tag + "_gp_vn",
+          Eigen::Vector3d(5.0 * (i + 1) + (i == 1 ? shift : 0.0), 0.0, 1.5), 0.0});
+    }
+  }
+  points.push_back({"gate01_lap" + std::to_string(laps) + "_gp_vn", Eigen::Vector3d(5.0, 0.0, 1.5), 0.0});
+  points.push_back({"end", Eigen::Vector3d(20.0, 0.0, 1.5), 0.0});
+  return rl_policy::sentCourse(points);
+}
 
 VehicleState at(double x, double y, double z, double yaw = 0.0)
 {
@@ -1186,4 +1209,89 @@ TEST_F(Mission, TheStopCheckIsValidated) {
     decel.stop_decel_ms2 = bad;
     EXPECT_THROW(MissionController(decel, bank()), std::invalid_argument) << bad;
   }
+}
+
+TEST_F(Mission, ARacePilotCourseMustMatchBeforeTheRaceStarts) {
+  MissionConfig sent = config(MissionType::Race, 1);
+  sent.course_source = rl_policy::CourseSource::RacePilot;
+  MissionController mission(sent, bank());
+  EXPECT_FALSE(mission.courseReady());
+  EXPECT_FALSE(mission.start());
+  EXPECT_EQ(mission.phase(), Phase::Idle);
+
+  const rl_policy::CourseMatch refused = mission.takeSentCourse(sentThreeGates(1, 0.3));
+  EXPECT_FALSE(refused.matches);
+  EXPECT_NE(refused.reason.find("gate 1 (gate02)"), std::string::npos) << refused.reason;
+  EXPECT_FALSE(mission.courseReady());
+  EXPECT_FALSE(mission.start());
+
+  const rl_policy::CourseMatch match = mission.takeSentCourse(sentThreeGates(1, 0.05));
+  EXPECT_TRUE(match.matches) << match.reason;
+  EXPECT_TRUE(mission.courseReady());
+  // The sent gates are what the race flies.
+  EXPECT_NEAR(mission.sequencer().course().gate(1).position.x(), 10.05, 1e-12);
+  EXPECT_EQ(mission.sequencer().config().total_crossings.value_or(-1), 4);
+  EXPECT_TRUE(mission.start());
+  EXPECT_FALSE(mission.takeSentCourse(sentThreeGates(1)).matches);
+}
+
+TEST_F(Mission, ASentCourseFinishesOnItsLastCrossingNotOnItsLaps) {
+  MissionConfig sent = config(MissionType::Race, 1);
+  sent.course_source = rl_policy::CourseSource::RacePilot;
+  MissionController mission(sent, bank());
+  ASSERT_TRUE(mission.takeSentCourse(sentThreeGates(1)).matches);
+  ASSERT_TRUE(mission.start());
+  // One lap, then back before the first gate for the closing crossing.
+  const std::vector<double> xs = {4.8, 5.2, 9.8, 10.2, 14.8, 15.2, 4.8, 5.2};
+  StepResult last;
+  for (std::size_t i = 0; i < xs.size(); ++i) {
+    last = mission.step(at(xs[i], 0.0, 1.5), static_cast<double>(i) * kDt);
+    if (i + 1 < xs.size()) {
+      EXPECT_EQ(mission.phase(), Phase::Race) << "step " << i;
+    }
+  }
+  EXPECT_EQ(mission.phase(), Phase::Hold);
+  EXPECT_EQ(last.status.exit_reason, ExitReason::Finished);
+  EXPECT_EQ(last.status.gates_passed, 4);
+  EXPECT_EQ(last.status.lap, 1);
+}
+
+TEST_F(Mission, AConfiguredCourseTakesNoSentOne) {
+  MissionController mission(config(MissionType::Race, 1), bank());
+  EXPECT_TRUE(mission.courseReady());
+  const rl_policy::CourseMatch match = mission.takeSentCourse(sentThreeGates(1));
+  EXPECT_FALSE(match.matches);
+  EXPECT_NE(match.reason.find("race_pilot"), std::string::npos) << match.reason;
+  EXPECT_EQ(mission.sequencer().course().gate(1).position.x(), 10.0);
+}
+
+TEST_F(Mission, TheConfiguredCourseMustBeTheOneTheRacePolicyTrainedOn) {
+  rl_policy::TrainedCourse trained;
+  trained.track_id = "three_gates";
+  trained.names = {"gate01", "gate02", "gate03"};
+  trained.gates = config().gates;
+  race->trainOn(trained);
+  EXPECT_NO_THROW(MissionController(config(), bank()));
+
+  trained.gates[2].position.y() += 0.5;
+  race->trainOn(trained);
+  try {
+    MissionController mission(config(), bank());
+    FAIL() << "a course other than the trained one was accepted";
+  } catch (const std::invalid_argument & e) {
+    const std::string what = e.what();
+    EXPECT_NE(what.find("not the circuit the race policy trained on (three_gates)"), std::string::npos)
+      << what;
+    EXPECT_NE(what.find("gate 2"), std::string::npos) << what;
+  }
+}
+
+TEST_F(Mission, CourseSourceNames) {
+  EXPECT_STREQ(rl_policy::toString(rl_policy::CourseSource::Configured), "configured");
+  EXPECT_STREQ(rl_policy::toString(rl_policy::CourseSource::RacePilot), "race_pilot");
+  EXPECT_EQ(rl_policy::courseSourceFromString("race_pilot"), rl_policy::CourseSource::RacePilot);
+  EXPECT_THROW(rl_policy::courseSourceFromString("pilot"), std::invalid_argument);
+  MissionConfig bad = config();
+  bad.match_position_m = 0.0;
+  EXPECT_THROW(MissionController(bad, bank()), std::invalid_argument);
 }

@@ -24,6 +24,9 @@
         gates_yaw: [3.141593, 2.356194]
         bounds_x: [1.0, 22.0]
         bounds_y: [1.0, 32.0]
+        source: configured # configured: race these gates | race_pilot: race the crossings as2_race_pilot sends once a lap matches these gates, the circuit the race policy trained on
+        match_position_m: 0.1 # race_pilot: a sent gate within this of its configured one
+        match_yaw_deg: 5.0 # race_pilot: and its yaw within this
       race:
         laps: 3
         pass_tolerance_m: 0.9 # a square gate's pass window, physical or virtual: its real half-opening

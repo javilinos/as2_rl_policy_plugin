@@ -87,6 +87,9 @@ GateSequencer::GateSequencer(Course course, SequencerConfig config)
   if (config_.laps < 1) {
     throw std::invalid_argument("race.laps must be at least 1");
   }
+  if (config_.total_crossings && *config_.total_crossings < 1) {
+    throw std::invalid_argument("a race finishing on its crossings needs at least one");
+  }
   if (!(config_.pass_tolerance_m > 0.0) || !(config_.valid_half_m > 0.0)) {
     throw std::invalid_argument("race.pass_tolerance_m and race.valid_half_m must be positive");
   }
@@ -142,7 +145,9 @@ GateUpdate GateSequencer::update(const Eigen::Vector3d & previous, const Eigen::
       target_ = course_.next(target_);
       steps_since_pass_ = 0;
       update.event = GateEvent::Passed;
-      if (lap_ == config_.laps) {
+      if (config_.total_crossings ? gates_passed_ == *config_.total_crossings :
+        lap_ == config_.laps)
+      {
         finished_ = true;
         update.event = GateEvent::Finished;
       }

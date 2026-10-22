@@ -10,11 +10,13 @@
 #include <string>
 #include <vector>
 
+#include "as2_rl_policy/core/angles.hpp"
 #include "as2_rl_policy/core/course.hpp"
 #include "as2_rl_policy/core/decode.hpp"
 #include "as2_rl_policy/core/gates.hpp"
 #include "as2_rl_policy/core/observation.hpp"
 #include "as2_rl_policy/core/policy.hpp"
+#include "as2_rl_policy/core/race_pilot_course.hpp"
 
 namespace rl_policy
 {
@@ -68,6 +70,14 @@ enum class SetpointSource
   Here,
 };
 
+// Where the race's course comes from: course.gates_*, or as2_race_pilot's sent course, which has
+// to match course.gates_* (the circuit the race policy trained on) before the race can start.
+enum class CourseSource
+{
+  Configured,
+  RacePilot,
+};
+
 // What updateHoldReference() did with a sent reference.
 enum class ReferenceUpdate
 {
@@ -91,6 +101,11 @@ const char * toString(HoldReference reference);
 
 const char * toString(SetpointSource source);
 
+const char * toString(CourseSource source);
+
+// Throws std::invalid_argument for anything but "configured" or "race_pilot".
+CourseSource courseSourceFromString(const std::string & name);
+
 // Throws std::invalid_argument for anything but "race" or "hover".
 MissionType missionTypeFromString(const std::string & name);
 
@@ -103,7 +118,12 @@ HoldReference holdReferenceFromString(const std::string & name);
 struct MissionConfig
 {
   MissionType type = MissionType::Race;
+  // The race's course, and with a sent one the circuit it is matched against.
   std::vector<Gate> gates;
+  CourseSource course_source = CourseSource::Configured;
+  // A sent course's gates match the configured ones within these.
+  double match_position_m = 0.10;
+  double match_yaw_rad = 5.0 * kPi / 180.0;
   Bounds bounds;
   int laps = 0;
   // The pass windows, virtual gates alike; the valid windows are logged only.
@@ -226,6 +246,13 @@ public:
   // A sent reference for the hover mission: where its hold starts, or the setpoint it moves to.
   ReferenceUpdate updateHoldReference(double x, double y, double z, double yaw);
 
+  // Idle, a race mission on a sent course: races it when one lap matches course.gates_*, with
+  // the sent gates' poses, and finishes on its last crossing. A mismatch leaves no course.
+  CourseMatch takeSentCourse(const SentCourse & course);
+
+  // The race can start: a configured course, or a sent one that matched.
+  bool courseReady() const;
+
   // One policy step, exactly one act() of the active policy.
   StepResult step(const VehicleState & state, double t);
 
@@ -251,8 +278,16 @@ public:
   // The last sent reference the hover mission took, unclamped.
   const std::optional<Gate> & sentReference() const {return sent_reference_;}
 
+  // The sent course the race flies, once one matched.
+  const std::optional<SentCourse> & sentCourse() const {return sent_course_;}
+
+  // What the last takeSentCourse() found.
+  const std::optional<CourseMatch> & lastMatch() const {return last_match_;}
+
 private:
   static MissionConfig validated(MissionConfig config, const PolicyBank & policies);
+
+  SequencerConfig sequencerConfig(std::optional<int> total_crossings) const;
 
   void activate(const std::string & name);
 
@@ -276,6 +311,8 @@ private:
   bool has_previous_position_ = false;
   int outside_steps_ = 0;
   std::optional<Gate> sent_reference_;
+  std::optional<SentCourse> sent_course_;
+  std::optional<CourseMatch> last_match_;
   std::vector<MissionEvent> events_;
 };
 
