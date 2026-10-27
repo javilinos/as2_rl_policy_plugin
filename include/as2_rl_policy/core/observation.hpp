@@ -53,10 +53,23 @@ GateRelativeObservation gateRelativeObservation(
   const VehicleState & state, const Gate & target, const Eigen::Vector4d & next_block,
   double motor_speed_normalization);
 
-// Entries 0..19 at the target of the course, then the history, rounded to float32 as trained.
+// [R00, R10, R20, R02, R12, R22] of R = Rz(yaw) Ry(pitch) Rx(roll): the body x and thrust axes,
+// quadlab.obs.r6_from_euler.
+Eigen::Matrix<double, 6, 1> r6FromEuler(double roll, double pitch, double yaw);
+
+// The gate-relative entries of a layout: the kernel's 0..19, or with R6 their three angles
+// replaced by the R6 of those angles as float32, as the trainer encodes the kernel's float32 row
+// (quadlab.envs.rates_cpp.encode_row): 0..5, the six R6 entries, then the kernel's 9..19.
+Eigen::VectorXd gateRelativeBlock(
+  const VehicleState & state, const Gate & target, const Eigen::Vector4d & next_block,
+  double motor_speed_normalization, Attitude attitude);
+
+// The gate-relative entries at the target of the course, then the history, rounded to float32
+// as trained.
 Eigen::VectorXd buildObservation(
   const VehicleState & state, const Course & course, std::size_t target,
-  const ActionHistory & history, double motor_speed_normalization);
+  const ActionHistory & history, double motor_speed_normalization,
+  Attitude attitude = Attitude::Euler);
 
 }  // namespace rl_policy
 

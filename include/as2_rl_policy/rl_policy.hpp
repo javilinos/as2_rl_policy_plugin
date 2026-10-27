@@ -24,10 +24,11 @@
 namespace rl_policy
 {
 
-// Column layout of the step debug topic.
-inline constexpr const char kStepLabel[] = "rl_policy_step_v1";
-inline constexpr std::size_t kStepColumns = 61;
-inline constexpr std::size_t kStepObservationColumns = 28;
+// Column layout of the step debug topic: room for an R6 observation with two commands of
+// history, NaN past a shorter one.
+inline constexpr const char kStepLabel[] = "rl_policy_step_v2";
+inline constexpr std::size_t kStepColumns = 64;
+inline constexpr std::size_t kStepObservationColumns = 31;
 
 class Plugin : public as2_motion_controller_plugin_base::ControllerBase
 {

@@ -36,7 +36,8 @@ constexpr double kDt = 0.01;
 class CountingPolicy : public rl_policy::Policy
 {
 public:
-  CountingPolicy(const std::string & task, double offset)
+  CountingPolicy(
+    const std::string & task, double offset, const char * layout = rl_policy::kGateRelativeLayout)
   : offset_(offset)
   {
     spec_.task = task;
@@ -44,9 +45,9 @@ public:
     spec_.action.contract = rl_policy::kBodyRatesContract;
     spec_.action.specific_thrust_max_ms2 = 40.0;
     spec_.action.max_body_rate_rad_s = {20.0, 20.0, 20.0};
-    spec_.observation.layout = rl_policy::kGateRelativeLayout;
+    spec_.observation.layout = layout;
     spec_.observation.action_history = 2;
-    spec_.observation.dim = 28;
+    spec_.observation.dim = rl_policy::gateRelativeSize(rl_policy::layoutAttitude(layout)) + 8;
     spec_.observation.motor_speed_normalization = 3000.0;
   }
 
@@ -324,6 +325,51 @@ TEST_F(Mission, HistoryIsZeroedOnlyWhenThePolicyChanges) {
   expectHistory(retarget.observation, hover->actionAt(2), hover->actionAt(1));
   EXPECT_EQ(retarget.frame.position, Eigen::Vector3d(2.0, 2.0, 2.0));
   EXPECT_EQ(race->calls(), 3u);
+}
+
+TEST_F(Mission, AnR6RaceHandsOverToAnEulerHover) {
+  race = std::make_shared<CountingPolicy>("race", 0.1, rl_policy::kGateRelativeR6Layout);
+  MissionController mission(config(), bank());
+  mission.start();
+
+  // Inverted and rolled past 180 deg: the race policy reads the gate-frame axes (gate yaw 0).
+  VehicleState inverted = at(0.0, 0.0, 1.5);
+  inverted.orientation = Eigen::AngleAxisd(0.2, Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(3.3, Eigen::Vector3d::UnitX());
+  const StepResult first = mission.step(inverted, 0.0);
+  ASSERT_EQ(first.observation.size(), 31);
+  const Eigen::Matrix3d rotation = inverted.orientation.toRotationMatrix();
+  for (int k = 0; k < 3; ++k) {
+    EXPECT_NEAR(first.observation(6 + k), rotation(k, 0), 1e-6) << "body x " << k;
+    EXPECT_NEAR(first.observation(9 + k), rotation(k, 2), 1e-6) << "thrust axis " << k;
+  }
+  EXPECT_LT(first.observation(11), -0.9);
+  for (int i = 23; i < 31; ++i) {
+    EXPECT_EQ(first.observation(i), 0.0) << "entry " << i;
+  }
+  const StepResult second = mission.step(at(0.1, 0.0, 1.5), kDt);
+  const Action newest = rl_policy::clip(race->actionAt(1));
+  for (int k = 0; k < 4; ++k) {
+    EXPECT_EQ(second.observation(23 + k), f32(newest[k])) << "a(t-1) entry " << k;
+    EXPECT_EQ(second.observation(27 + k), 0.0) << "a(t-2) entry " << k;
+  }
+
+  // The hover policy reads its own layout, the Euler angles, with a fresh history.
+  ASSERT_TRUE(mission.requestHold(1.0, 1.0, 2.0, 0.3));
+  const StepResult held = mission.step(inverted, 2 * kDt);
+  EXPECT_EQ(hover->calls(), 1u);
+  ASSERT_EQ(held.observation.size(), 28);
+  double roll = 0.0;
+  double pitch = 0.0;
+  double yaw = 0.0;
+  rl_policy::quaternionToEuler(inverted.orientation, roll, pitch, yaw);
+  EXPECT_EQ(held.observation(6), f32(rl_policy::wrapPi(roll)));
+  EXPECT_EQ(held.observation(7), f32(rl_policy::wrapPi(pitch)));
+  EXPECT_EQ(held.observation(8), f32(rl_policy::wrapPi(yaw - 0.3)));
+  expectZeroHistory(held.observation);
+  const StepResult held_again = mission.step(at(0.3, 0.0, 1.5), 3 * kDt);
+  expectHistory(held_again.observation, hover->actionAt(1), Action{});
+  EXPECT_EQ(race->calls(), 2u);
 }
 
 TEST_F(Mission, FinishHoldsWhereTheLastCrossingEnds) {

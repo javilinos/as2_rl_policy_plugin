@@ -32,7 +32,8 @@ ActionHistory historyFromRow(const std::vector<double> & values, std::size_t len
   return history;
 }
 
-// Every fixture row rebuilt from its state and compared with the kernel's observation.
+// Every fixture row rebuilt from its state and compared with the trainer's observation, in the
+// fixture's layout (the Euler one when it names none).
 void checkFixture(const std::string & name)
 {
   const YAML::Node fixture = rl_policy_test::loadFixture(name);
@@ -40,6 +41,8 @@ void checkFixture(const std::string & name)
   const double normalization = fixture["motor_speed_normalization"].as<double>();
   const std::size_t length = fixture["action_history"].as<std::size_t>();
   const double tolerance = fixture["tolerance"].as<double>();
+  const rl_policy::Attitude attitude = rl_policy::layoutAttitude(
+    fixture["layout"] ? fixture["layout"].as<std::string>() : rl_policy::kGateRelativeLayout);
   const YAML::Node rows = fixture["rows"];
   ASSERT_GT(rows.size(), 0u);
 
@@ -52,7 +55,7 @@ void checkFixture(const std::string & name)
     targets.insert(target % course.size());
 
     const Eigen::VectorXd obs = rl_policy::buildObservation(
-      state, course, target, history, normalization);
+      state, course, target, history, normalization, attitude);
     ASSERT_EQ(static_cast<std::size_t>(obs.size()), expected.size()) << name << " row " << r;
     for (std::size_t i = 0; i < expected.size(); ++i) {
       EXPECT_NEAR(obs(static_cast<Eigen::Index>(i)), expected[i], tolerance)
@@ -70,6 +73,95 @@ TEST(Observation, SeasonTwoRowsMatchTheKernel) {
 
 TEST(Observation, HoverRowsMatchTheKernel) {
   checkFixture("obs_hover.yaml");
+}
+
+TEST(Observation, SeasonTwoR6RowsMatchTheTrainer) {
+  checkFixture("obs_season2_r6.yaml");
+}
+
+// The R6 entries are the gate-frame body x and thrust axes of the quaternion itself, whatever its
+// Euler angles, and the rest of the row is the Euler row's, shifted by three.
+TEST(Observation, R6IsTheGateFrameRotationOfTheQuaternion) {
+  const YAML::Node fixture = rl_policy_test::loadFixture("obs_season2_r6.yaml");
+  const Course course(rl_policy_test::courseGates(fixture["course"]));
+  const YAML::Node rows = fixture["rows"];
+  for (std::size_t r = 0; r < rows.size(); ++r) {
+    const auto state = rl_policy_test::stateFromRow(doubles(rows[r]["state"]));
+    const std::size_t target = rows[r]["target"].as<std::size_t>();
+    const Eigen::VectorXd r6 = rl_policy::buildObservation(
+      state, course, target, ActionHistory(2), 3000.0, rl_policy::Attitude::R6);
+    const Eigen::VectorXd euler = rl_policy::buildObservation(
+      state, course, target, ActionHistory(2), 3000.0, rl_policy::Attitude::Euler);
+    ASSERT_EQ(r6.size(), 31);
+    ASSERT_EQ(euler.size(), 28);
+
+    const Eigen::Matrix3d gate_frame =
+      (Eigen::AngleAxisd(-course.gate(target).yaw, Eigen::Vector3d::UnitZ()) *
+      state.orientation.normalized()).toRotationMatrix();
+    for (int k = 0; k < 3; ++k) {
+      EXPECT_NEAR(r6(6 + k), gate_frame(k, 0), 1e-6) << "row " << r << " body x " << k;
+      EXPECT_NEAR(r6(9 + k), gate_frame(k, 2), 1e-6) << "row " << r << " thrust axis " << k;
+    }
+    for (int i = 0; i < 6; ++i) {
+      EXPECT_EQ(r6(i), euler(i)) << "row " << r << " entry " << i;
+    }
+    for (int i = 9; i < 28; ++i) {
+      EXPECT_EQ(r6(i + 3), euler(i)) << "row " << r << " entry " << i;
+    }
+  }
+}
+
+// Across the roll's wrap the Euler row jumps by 2 pi and the R6 row does not.
+TEST(Observation, R6IsContinuousWhereTheRollWraps) {
+  const Course course(std::vector<rl_policy::Gate>{rl_policy::Gate()});
+  rl_policy::VehicleState before;
+  rl_policy::VehicleState after;
+  const double pi = rl_policy::kPi;
+  before.orientation = Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitY()) *
+    Eigen::AngleAxisd(pi - 1e-4, Eigen::Vector3d::UnitX());
+  after.orientation = Eigen::AngleAxisd(0.3, Eigen::Vector3d::UnitZ()) *
+    Eigen::AngleAxisd(0.4, Eigen::Vector3d::UnitY()) *
+    Eigen::AngleAxisd(pi + 1e-4, Eigen::Vector3d::UnitX());
+  const auto observe = [&](const rl_policy::VehicleState & state, rl_policy::Attitude attitude) {
+      return rl_policy::buildObservation(state, course, 0, ActionHistory(2), 3000.0, attitude);
+    };
+  const Eigen::VectorXd euler_before = observe(before, rl_policy::Attitude::Euler);
+  const Eigen::VectorXd euler_after = observe(after, rl_policy::Attitude::Euler);
+  EXPECT_GT(std::abs(euler_before(6) - euler_after(6)), 6.0);
+  const Eigen::VectorXd r6_before = observe(before, rl_policy::Attitude::R6);
+  const Eigen::VectorXd r6_after = observe(after, rl_policy::Attitude::R6);
+  EXPECT_LT((r6_before.segment<6>(6) - r6_after.segment<6>(6)).cwiseAbs().maxCoeff(), 1e-3);
+  EXPECT_LT(r6_before(11), -0.9) << "the thrust axis points down, inverted";
+}
+
+TEST(Observation, R6HistoryFollowsTheTwentyThreeEntries) {
+  ActionHistory history(2);
+  const rl_policy::Action older{0.1, 0.2, 0.3, 0.4};
+  const rl_policy::Action newer{-0.5, -0.6, -0.7, -0.8};
+  history.push(older);
+  history.push(newer);
+  const Course course(std::vector<rl_policy::Gate>{rl_policy::Gate()});
+  const Eigen::VectorXd obs = rl_policy::buildObservation(
+    rl_policy::VehicleState(), course, 0, history, 3000.0, rl_policy::Attitude::R6);
+  ASSERT_EQ(obs.size(), 31);
+  for (int k = 0; k < 4; ++k) {
+    EXPECT_EQ(obs(23 + k), static_cast<double>(static_cast<float>(newer[k])));
+    EXPECT_EQ(obs(27 + k), static_cast<double>(static_cast<float>(older[k])));
+  }
+  // Level and facing the gate: the body x axis along the gate's x, the thrust axis up.
+  const std::vector<double> level = {1.0, 0.0, 0.0, 0.0, 0.0, 1.0};
+  for (int k = 0; k < 6; ++k) {
+    EXPECT_NEAR(obs(6 + k), level[k], 1e-7) << "entry " << 6 + k;
+  }
+}
+
+TEST(Observation, LayoutsAreTheKernelsAndR6) {
+  EXPECT_EQ(rl_policy::layoutAttitude("gate_relative_20"), rl_policy::Attitude::Euler);
+  EXPECT_EQ(rl_policy::layoutAttitude("gate_relative_r6_23"), rl_policy::Attitude::R6);
+  EXPECT_EQ(rl_policy::gateRelativeSize(rl_policy::Attitude::Euler), 20);
+  EXPECT_EQ(rl_policy::gateRelativeSize(rl_policy::Attitude::R6), 23);
+  EXPECT_THROW(rl_policy::layoutAttitude("gate_relative_30"), rl_policy::PolicyError);
 }
 
 TEST(Observation, OneGateCourseHasNoNextGate) {

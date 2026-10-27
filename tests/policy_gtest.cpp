@@ -20,6 +20,7 @@ using rl_policy_test::fixturePath;
 using rl_policy_test::writeYaml;
 
 const char kPolicyFixture[] = "policy_random.yaml";
+const char kR6PolicyFixture[] = "policy_random_r6.yaml";
 
 YAML::Node policyYaml()
 {
@@ -90,6 +91,46 @@ TEST(PolicyFile, LoadsAndReproducesItsGoldens) {
     for (int k = 0; k < 4; ++k) {
       EXPECT_NEAR(action[k], expected[k], tolerance) << "row " << row << " entry " << k;
     }
+  }
+}
+
+TEST(PolicyFile, LoadsAnR6PolicyAndReproducesItsGoldens) {
+  const auto policy = MlpPolicy::load(fixturePath(kR6PolicyFixture));
+  const rl_policy::PolicySpec & spec = policy->spec();
+  EXPECT_EQ(spec.observation.layout, rl_policy::kGateRelativeR6Layout);
+  EXPECT_EQ(spec.observation.dim, 23 + 4 * spec.observation.action_history);
+  EXPECT_EQ(spec.observation.dim, 31);
+  EXPECT_EQ(policy->layers().front().weight.cols(), 31);
+  EXPECT_LE(policy->goldenCheck().max_error, policy->goldenCheck().tolerance);
+
+  const YAML::Node golden = rl_policy_test::loadFixture(kR6PolicyFixture)["golden"];
+  const double tolerance = golden["tolerance"].as<double>();
+  for (std::size_t row = 0; row < golden["obs"].size(); ++row) {
+    const auto obs = rl_policy_test::doubles(golden["obs"][row]);
+    const auto expected = rl_policy_test::doubles(golden["action"][row]);
+    ASSERT_EQ(obs.size(), 31u);
+    const rl_policy::Action action = policy->act(
+      Eigen::Map<const Eigen::VectorXd>(obs.data(), static_cast<Eigen::Index>(obs.size())));
+    for (int k = 0; k < 4; ++k) {
+      EXPECT_NEAR(action[k], expected[k], tolerance) << "row " << row << " entry " << k;
+    }
+  }
+}
+
+TEST(PolicyFile, RefusesALayoutWhoseWidthIsTheOthers) {
+  {
+    YAML::Node node = policyYaml();
+    node["observation"]["layout"] = rl_policy::kGateRelativeR6Layout;
+    const std::string message = refusal(node);
+    EXPECT_NE(message.find("observation.dim is 28, but 23 (gate_relative_r6_23)"),
+      std::string::npos) << message;
+  }
+  {
+    YAML::Node node = YAML::Clone(rl_policy_test::loadFixture(kR6PolicyFixture));
+    node["observation"]["layout"] = rl_policy::kGateRelativeLayout;
+    const std::string message = refusal(node);
+    EXPECT_NE(message.find("observation.dim is 31, but 20 (gate_relative_20)"),
+      std::string::npos) << message;
   }
 }
 
@@ -261,6 +302,22 @@ TEST(PolicyBank, SharesOneDt) {
   PolicyBank stubs;
   stubs.add("race", std::make_shared<StubPolicy>(supportedSpec(0.01)));
   EXPECT_THROW(stubs.add("hover", std::make_shared<StubPolicy>(supportedSpec(0.02))), PolicyError);
+  EXPECT_NO_THROW(stubs.add("hover", std::make_shared<StubPolicy>(supportedSpec(0.01))));
+}
+
+TEST(PolicyBank, AnR6RacePolicyAndAnEulerHoverPolicyShareOneBank) {
+  const PolicyBank bank = PolicyBank::load(
+    {"race", "hover"}, {fixturePath(kR6PolicyFixture), fixturePath(kPolicyFixture)});
+  EXPECT_EQ(bank.get("race")->spec().observation.layout, rl_policy::kGateRelativeR6Layout);
+  EXPECT_EQ(bank.get("hover")->spec().observation.layout, rl_policy::kGateRelativeLayout);
+  EXPECT_EQ(bank.get("race")->spec().observation.dim, 31);
+  EXPECT_EQ(bank.get("hover")->spec().observation.dim, 28);
+
+  PolicyBank stubs;
+  rl_policy::PolicySpec r6 = supportedSpec(0.01);
+  r6.observation.layout = rl_policy::kGateRelativeR6Layout;
+  r6.observation.dim = 31;
+  EXPECT_NO_THROW(stubs.add("race", std::make_shared<StubPolicy>(r6)));
   EXPECT_NO_THROW(stubs.add("hover", std::make_shared<StubPolicy>(supportedSpec(0.01))));
 }
 

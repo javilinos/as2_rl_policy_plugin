@@ -305,6 +305,8 @@ private:
   GateSequencer sequencer_;
   Course hold_course_;
   std::shared_ptr<const Policy> active_;
+  // The active policy's layout: each policy file says its own.
+  Attitude attitude_ = Attitude::Euler;
   ActionHistory history_;
   MissionStatus status_;
   Eigen::Vector3d previous_position_ = Eigen::Vector3d::Zero();

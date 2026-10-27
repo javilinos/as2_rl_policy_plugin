@@ -15,6 +15,14 @@ Every race exit (laps done, a missed gate, no pass within the timeout, out of bo
 mode request) ends in a hold at the current pose with the `hover` policy, or, for laps done with
 `hold.after_race: setpoint`, at `hold.setpoint`. Landing stays manual.
 
+Each policy file names its observation layout (`observation.layout`), and each phase builds the
+active policy's: `gate_relative_20`, the kernel's 20 entries with its Euler roll, pitch and yaw to
+the gate at 6..8, or `gate_relative_r6_23`, the same row with those three angles replaced by the
+six R6 entries at 6..11 (`[R00, R10, R20, R02, R12, R22]` of `Rz(yaw) Ry(pitch) Rx(roll)`, the
+body x and thrust axes in the gate frame, quadlab's `rates_wrapper.attitude: r6`), continuous
+where the angles wrap. Either is followed by `observation.action_history` commands, so a race
+policy in one layout hands over to a hover policy in the other.
+
 ## Parameters
 
 `config/rl_policy_default.yaml` carries every required key with its default; the flight's own
@@ -67,8 +75,10 @@ rad/s in the policy's motor order (RR, FR, RL, FL). The default is the aircraft'
 names the simulator's `sensor_measurements/motor_speed`.
 
 Debug topics: `debug/controller/rl_policy/status` (`diagnostic_msgs/DiagnosticStatus`) and
-`debug/controller/rl_policy/step` (`std_msgs/Float64MultiArray`, 61 columns labelled
-`rl_policy_step_v1`), under the drone namespace. The status carries `hold_reference`,
+`debug/controller/rl_policy/step` (`std_msgs/Float64MultiArray`, 64 columns labelled
+`rl_policy_step_v2`: time, phase, target, lap, the target frame, the state, 31 observation
+columns, NaN past a shorter observation, the action and the command), under the drone namespace.
+The status carries `hold_reference`,
 `setpoint_source` (`configured`, `sent`, `here` for a pose the vehicle was at, `none`) and
 `setpoint_x/y/z/yaw`, which the hover mission reports from Idle on: where its hold will start.
 The last crossing is `last_crossing_gate`, `_lateral_m`, `_vertical_m`, `_passed`, `_valid` and

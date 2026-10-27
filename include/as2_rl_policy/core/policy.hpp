@@ -21,9 +21,12 @@ using Action = std::array<double, 4>;
 
 inline constexpr int kActionSize = 4;
 inline constexpr int kGateRelativeSize = 20;
+inline constexpr int kGateRelativeR6Size = 23;
 inline constexpr const char kPolicyFormat[] = "quadlab_policy";
 inline constexpr int kPolicyFormatVersion = 1;
 inline constexpr const char kGateRelativeLayout[] = "gate_relative_20";
+// The same row with its three Euler angles replaced by the six R6 entries.
+inline constexpr const char kGateRelativeR6Layout[] = "gate_relative_r6_23";
 inline constexpr const char kBodyRatesContract[] = "indi_body_rates_v1";
 inline constexpr const char kTanhActivation[] = "tanh";
 inline constexpr const char kClipOutput[] = "clip";
@@ -79,6 +82,20 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+// How a layout carries the attitude: the kernel's roll, pitch and yaw to the gate at entries
+// 6..8, or the body x and thrust axes in the gate frame at entries 6..11.
+enum class Attitude
+{
+  Euler,
+  R6
+};
+
+// The attitude of a layout this plugin flies; throws PolicyError for any other.
+Attitude layoutAttitude(const std::string & layout);
+
+// The gate-relative entries before the history: 20, or 23 with R6.
+int gateRelativeSize(Attitude attitude);
+
 class Policy
 {
 public:
@@ -89,7 +106,7 @@ public:
   virtual const PolicySpec & spec() const = 0;
 };
 
-// Throws PolicyError unless the spec is the gate-relative layout with the body-rate decode.
+// Throws PolicyError unless the spec is a gate-relative layout with the body-rate decode.
 void checkSupported(const PolicySpec & spec);
 
 class MlpPolicy : public Policy

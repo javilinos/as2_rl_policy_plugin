@@ -224,21 +224,36 @@ std::vector<std::vector<double>> rows(
 
 }  // namespace
 
+Attitude layoutAttitude(const std::string & layout)
+{
+  if (layout == kGateRelativeLayout) {
+    return Attitude::Euler;
+  }
+  if (layout == kGateRelativeR6Layout) {
+    return Attitude::R6;
+  }
+  throw PolicyError(
+          "observation layout '" + layout + "' is not supported, only '" + kGateRelativeLayout +
+          "' or '" + kGateRelativeR6Layout + "'");
+}
+
+int gateRelativeSize(Attitude attitude)
+{
+  return attitude == Attitude::R6 ? kGateRelativeR6Size : kGateRelativeSize;
+}
+
 void checkSupported(const PolicySpec & spec)
 {
-  if (spec.observation.layout != kGateRelativeLayout) {
-    throw PolicyError(
-            "observation layout '" + spec.observation.layout + "' is not supported, only '" +
-            kGateRelativeLayout + "'");
-  }
+  const int base = gateRelativeSize(layoutAttitude(spec.observation.layout));
   if (spec.observation.action_history < 0) {
     throw PolicyError("observation.action_history must be >= 0");
   }
-  const int expected = kGateRelativeSize + kActionSize * spec.observation.action_history;
+  const int expected = base + kActionSize * spec.observation.action_history;
   if (spec.observation.dim != expected) {
     throw PolicyError(
             "observation.dim is " + std::to_string(spec.observation.dim) + ", but " +
-            std::to_string(kGateRelativeSize) + " + " + std::to_string(kActionSize) + " * " +
+            std::to_string(base) + " (" + spec.observation.layout + ") + " +
+            std::to_string(kActionSize) + " * " +
             std::to_string(spec.observation.action_history) + " = " + std::to_string(expected));
   }
   if (!(spec.observation.motor_speed_normalization > 0.0) ||

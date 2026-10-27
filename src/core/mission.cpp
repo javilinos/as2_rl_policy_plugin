@@ -482,7 +482,7 @@ StepResult MissionController::step(const VehicleState & state, double t)
   result.t = t;
   result.frame = course.gate(target);
   result.observation = buildObservation(
-    state, course, target, history_, spec.observation.motor_speed_normalization);
+    state, course, target, history_, spec.observation.motor_speed_normalization, attitude_);
   result.action = clip(active_->act(result.observation));
   history_.push(result.action);
   result.command = decode(result.action, spec.action, config_.mass_kg);
@@ -516,6 +516,7 @@ void MissionController::activate(const std::string & name)
   }
   active_ = policies_.get(name);
   status_.policy = name;
+  attitude_ = layoutAttitude(active_->spec().observation.layout);
   history_ = ActionHistory(static_cast<std::size_t>(active_->spec().observation.action_history));
 }
 

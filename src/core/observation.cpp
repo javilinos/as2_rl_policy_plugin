@@ -81,16 +81,47 @@ GateRelativeObservation gateRelativeObservation(
   return obs;
 }
 
+Eigen::Matrix<double, 6, 1> r6FromEuler(double roll, double pitch, double yaw)
+{
+  const double cr = std::cos(roll);
+  const double sr = std::sin(roll);
+  const double cp = std::cos(pitch);
+  const double sp = std::sin(pitch);
+  const double cy = std::cos(yaw);
+  const double sy = std::sin(yaw);
+  Eigen::Matrix<double, 6, 1> r6;
+  r6 << cy * cp, sy * cp, -sp, cy * sp * cr + sy * sr, sy * sp * cr - cy * sr, cp * cr;
+  return r6;
+}
+
+Eigen::VectorXd gateRelativeBlock(
+  const VehicleState & state, const Gate & target, const Eigen::Vector4d & next_block,
+  double motor_speed_normalization, Attitude attitude)
+{
+  const GateRelativeObservation kernel =
+    gateRelativeObservation(state, target, next_block, motor_speed_normalization);
+  if (attitude == Attitude::Euler) {
+    return kernel;
+  }
+  const auto f32 = [](double value) {return static_cast<double>(static_cast<float>(value));};
+  Eigen::VectorXd block(kGateRelativeR6Size);
+  block.head<6>() = kernel.head<6>();
+  block.segment<6>(6) = r6FromEuler(f32(kernel(6)), f32(kernel(7)), f32(kernel(8)));
+  block.tail<kGateRelativeSize - 9>() = kernel.tail<kGateRelativeSize - 9>();
+  return block;
+}
+
 Eigen::VectorXd buildObservation(
   const VehicleState & state, const Course & course, std::size_t target,
-  const ActionHistory & history, double motor_speed_normalization)
+  const ActionHistory & history, double motor_speed_normalization, Attitude attitude)
 {
-  Eigen::VectorXd obs(kGateRelativeSize + kActionSize * static_cast<Eigen::Index>(history.size()));
-  obs.head<kGateRelativeSize>() = gateRelativeObservation(
-    state, course.gate(target), course.nextBlock(target), motor_speed_normalization);
+  const Eigen::Index base = gateRelativeSize(attitude);
+  Eigen::VectorXd obs(base + kActionSize * static_cast<Eigen::Index>(history.size()));
+  obs.head(base) = gateRelativeBlock(
+    state, course.gate(target), course.nextBlock(target), motor_speed_normalization, attitude);
   for (std::size_t age = 0; age < history.size(); ++age) {
     for (int k = 0; k < kActionSize; ++k) {
-      obs(kGateRelativeSize + kActionSize * static_cast<Eigen::Index>(age) + k) = history[age][k];
+      obs(base + kActionSize * static_cast<Eigen::Index>(age) + k) = history[age][k];
     }
   }
   return obs.cast<float>().cast<double>();

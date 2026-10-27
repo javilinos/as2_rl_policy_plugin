@@ -33,6 +33,7 @@ using rl_policy::SetpointSource;
 
 constexpr char kNamespace[] = "test_rl_policy";
 constexpr char kPolicyFixture[] = "policy_random.yaml";
+constexpr char kR6PolicyFixture[] = "policy_random_r6.yaml";
 
 double policyDt()
 {
@@ -844,9 +845,9 @@ TEST_F(PluginTest, StepsOncePerPeriodAndHoldsTheCommandInBetween) {
   ASSERT_EQ(steps_.size(), 3u);
   const std_msgs::msg::Float64MultiArray & step = steps_.back();
   ASSERT_EQ(step.layout.dim.size(), 1u);
-  EXPECT_EQ(step.layout.dim[0].label, rl_policy::kStepLabel);
-  EXPECT_EQ(step.layout.dim[0].size, 61u);
-  ASSERT_EQ(step.data.size(), 61u);
+  EXPECT_EQ(step.layout.dim[0].label, "rl_policy_step_v2");
+  EXPECT_EQ(step.layout.dim[0].size, 64u);
+  ASSERT_EQ(step.data.size(), 64u);
   EXPECT_NEAR(step.data[0], 100.0 + 3.0 * dt, 1e-9);
   EXPECT_EQ(step.data[1], 1.0);
   EXPECT_EQ(step.data[2], 0.0);
@@ -854,8 +855,12 @@ TEST_F(PluginTest, StepsOncePerPeriodAndHoldsTheCommandInBetween) {
   EXPECT_DOUBLE_EQ(step.data[21], 1500.0);
   EXPECT_DOUBLE_EQ(step.data[24], 1530.0);
   EXPECT_NEAR(step.data[25 + 12], 2.0 * 1500.0 / 3000.0 - 1.0, 1e-6);
-  EXPECT_NEAR(step.data[57], thrust_out_.thrust, 1e-4);
-  EXPECT_NEAR(step.data[58], twist_out_.twist.angular.x, 1e-12);
+  // The fixture policy reads 28 observations; the three columns after them are NaN.
+  for (std::size_t i = 28; i < 31; ++i) {
+    EXPECT_TRUE(std::isnan(step.data[25 + i])) << "observation column " << i;
+  }
+  EXPECT_NEAR(step.data[60], thrust_out_.thrust, 1e-4);
+  EXPECT_NEAR(step.data[61], twist_out_.twist.angular.x, 1e-12);
 
   // The status timer runs on the node clock.
   setTime(100.25);
@@ -864,6 +869,48 @@ TEST_F(PluginTest, StepsOncePerPeriodAndHoldsTheCommandInBetween) {
   EXPECT_EQ(values(statuses_.back())["phase"], "race");
   EXPECT_EQ(values(statuses_.back())["overruns"], "1");
   EXPECT_EQ(values(statuses_.back())["steps"], "3");
+}
+
+TEST_F(PluginTest, AnR6RacePolicyHandsOverToAnEulerHoverPolicy) {
+  const std::string r6 = rl_policy_test::fixturePath(kR6PolicyFixture);
+  const std::string euler = rl_policy_test::fixturePath(kPolicyFixture);
+  build(with(
+    flightParameters(euler),
+    rclcpp::Parameter("rl_policy.policies.files", std::vector<std::string>{r6, euler})));
+  ASSERT_TRUE(plugin_->isReady());
+  const double dt = policyDt();
+  setTime(100.0);
+  setTrajectoryMode(pose(14.5, 2.0, 0.2, 3.14));
+  ASSERT_TRUE(firstStep());
+  EXPECT_EQ(missionStatus().policy, "race");
+
+  // A HOVER request: the hover policy, in its own layout, holds.
+  plugin_->reset();
+  plugin_->setHoverEnabled(true);
+  plugin_->updateReference(pose(14.5, 2.0, 1.5, 0.0));
+  ASSERT_EQ(plugin_->mission()->phase(), Phase::Hold);
+  EXPECT_EQ(missionStatus().policy, "hover");
+  setTime(100.0 + dt);
+  ASSERT_TRUE(computeOutput());
+
+  spin(std::chrono::milliseconds(300));
+  ASSERT_EQ(steps_.size(), 2u);
+  const std_msgs::msg::Float64MultiArray & raced = steps_[0];
+  const std_msgs::msg::Float64MultiArray & held = steps_[1];
+  ASSERT_EQ(raced.data.size(), 64u);
+  ASSERT_EQ(held.data.size(), 64u);
+  EXPECT_EQ(raced.data[1], 1.0);
+  EXPECT_EQ(held.data[1], 2.0);
+  for (std::size_t i = 0; i < 31; ++i) {
+    EXPECT_TRUE(std::isfinite(raced.data[25 + i])) << "race observation " << i;
+  }
+  for (std::size_t i = 0; i < 31; ++i) {
+    EXPECT_EQ(std::isfinite(held.data[25 + i]), i < 28) << "hold observation " << i;
+  }
+  // Level: the race's thrust axis is the gate frame's z, the hold's roll and pitch are zero.
+  EXPECT_NEAR(raced.data[25 + 11], 1.0, 1e-6);
+  EXPECT_NEAR(held.data[25 + 6], 0.0, 1e-6);
+  EXPECT_NEAR(held.data[25 + 7], 0.0, 1e-6);
 }
 
 TEST_F(PluginTest, StaleMotorSpeedsAreFlaggedNotRefused) {
