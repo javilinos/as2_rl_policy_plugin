@@ -45,6 +45,11 @@ double SequencerConfig::passTolerance(GateShape shape) const
          octagon_pass_tolerance_m.value_or(pass_tolerance_m) : pass_tolerance_m;
 }
 
+double SequencerConfig::passTolerance(const Gate & gate) const
+{
+  return gate.pass_tolerance_m.value_or(passTolerance(gate.shape));
+}
+
 double SequencerConfig::validHalf(GateShape shape) const
 {
   return shape == GateShape::Octagon ? octagon_valid_half_m.value_or(valid_half_m) : valid_half_m;
@@ -107,6 +112,13 @@ GateSequencer::GateSequencer(Course course, SequencerConfig config)
   if (!(config_.gate_timeout_s > 0.0) || !(config_.dt > 0.0)) {
     throw std::invalid_argument("race.gate_timeout_s and the policy dt must be positive");
   }
+  for (const Gate & gate : course_.gates()) {
+    if (gate.pass_tolerance_m &&
+      !(std::isfinite(*gate.pass_tolerance_m) && *gate.pass_tolerance_m > 0.0))
+    {
+      throw std::invalid_argument("course.gates_pass_tolerance_m must be finite and positive");
+    }
+  }
 }
 
 void GateSequencer::reset()
@@ -132,7 +144,7 @@ GateUpdate GateSequencer::update(const Eigen::Vector3d & previous, const Eigen::
     const double worst =
       openingNorm(gate.shape, update.crossing.lateral, update.crossing.vertical);
     update.valid = worst < config_.validHalf(gate);
-    const bool inside = worst < config_.passTolerance(gate.shape);
+    const bool inside = worst < config_.passTolerance(gate);
     if (!inside && !gate.is_virtual) {
       update.event = GateEvent::Missed;
       return update;

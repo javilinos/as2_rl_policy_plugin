@@ -3,6 +3,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "as2_rl_policy/core/angles.hpp"
@@ -155,6 +156,28 @@ TEST(SentCourse, TheFrontonCourseIsTwoLapsOfFourAndItsClosingGate) {
   EXPECT_EQ(course.extra, 1u);
   EXPECT_EQ(course.ignored, 3u);
   EXPECT_EQ(course.names.back(), "gate01");
+}
+
+TEST(SentCourse, TheEndPointIsTheLastPointNamedEnd) {
+  const SentCourse course = rl_policy::sentCourse(frontonCourse());
+  ASSERT_TRUE(course.end_point.has_value());
+  EXPECT_EQ(*course.end_point, Eigen::Vector3d(8.18, -5.0, 1.45));
+
+  // Only as the last point, finite: anything else is no end point and the course still stands.
+  std::vector<Waypoint> early = frontonCourse();
+  std::swap(early[early.size() - 2], early.back());
+  EXPECT_FALSE(rl_policy::sentCourse(early).end_point.has_value());
+  std::vector<Waypoint> unnamed = frontonCourse();
+  unnamed.back().id = "end_via";
+  EXPECT_FALSE(rl_policy::sentCourse(unnamed).end_point.has_value());
+  std::vector<Waypoint> none = frontonCourse();
+  none.pop_back();
+  EXPECT_FALSE(rl_policy::sentCourse(none).end_point.has_value());
+  std::vector<Waypoint> bad = frontonCourse();
+  bad.back().position.z() = std::numeric_limits<double>::quiet_NaN();
+  const SentCourse without = rl_policy::sentCourse(bad);
+  EXPECT_FALSE(without.end_point.has_value());
+  EXPECT_EQ(without.crossings.size(), 9u);
 }
 
 TEST(SentCourse, RefusesACourseWithoutACrossingOrWithANonFiniteOne) {

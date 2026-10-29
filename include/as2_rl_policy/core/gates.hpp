@@ -37,7 +37,7 @@ std::size_t countVirtual(const Course & course);
 struct SequencerConfig
 {
   int laps = 0;
-  // The pass windows, a shape's for every gate of it, virtual or not.
+  // The pass windows, a shape's for every gate of it, virtual or not, unless the gate has its own.
   double pass_tolerance_m = 0.0;
   double valid_half_m = 0.0;
   double gate_timeout_s = 0.0;
@@ -51,6 +51,9 @@ struct SequencerConfig
   std::optional<int> total_crossings;
 
   double passTolerance(GateShape shape) const;
+
+  // The gate's own window when it has one, else its shape's.
+  double passTolerance(const Gate & gate) const;
 
   double validHalf(GateShape shape) const;
 

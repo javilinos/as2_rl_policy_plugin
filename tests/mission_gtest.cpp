@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "as2_rl_policy/core/mission.hpp"
@@ -1300,6 +1301,123 @@ TEST_F(Mission, ASentCourseFinishesOnItsLastCrossingNotOnItsLaps) {
   EXPECT_EQ(last.status.exit_reason, ExitReason::Finished);
   EXPECT_EQ(last.status.gates_passed, 4);
   EXPECT_EQ(last.status.lap, 1);
+}
+
+TEST_F(Mission, ASentLapTakesTheConfiguredGatesOwnWindows) {
+  MissionConfig sent = config(MissionType::Race, 1);
+  sent.course_source = rl_policy::CourseSource::RacePilot;
+  sent.gates[1].pass_tolerance_m = 1.4;
+  MissionController mission(sent, bank());
+  ASSERT_TRUE(mission.takeSentCourse(sentThreeGates(1, 0.05)).matches);
+  const rl_policy::Course & course = mission.sequencer().course();
+  EXPECT_FALSE(course.gate(0).pass_tolerance_m.has_value());
+  EXPECT_EQ(course.gate(1).pass_tolerance_m.value_or(0.0), 1.4);
+  EXPECT_NEAR(course.gate(1).position.x(), 10.05, 1e-12);
+  ASSERT_TRUE(mission.start());
+  // Gate 1 is passed 1.2 m off its centre, past the squares' 0.9 m; gate 2 the same way misses.
+  mission.step(at(4.8, 0.0, 1.5), 0.0);
+  mission.step(at(5.2, 0.0, 1.5), kDt);
+  mission.step(at(9.8, 1.2, 1.5), 2 * kDt);
+  const StepResult passed = mission.step(at(10.3, 1.2, 1.5), 3 * kDt);
+  EXPECT_EQ(passed.status.gates_passed, 2);
+  EXPECT_EQ(mission.phase(), Phase::Race);
+  mission.step(at(14.8, 1.2, 1.5), 4 * kDt);
+  const StepResult missed = mission.step(at(15.2, 1.2, 1.5), 5 * kDt);
+  EXPECT_EQ(missed.status.exit_reason, ExitReason::Missed);
+
+  MissionConfig bad = sent;
+  bad.gates[1].pass_tolerance_m = 0.0;
+  EXPECT_THROW(MissionController(bad, bank()), std::invalid_argument);
+  bad.gates[1].pass_tolerance_m = std::numeric_limits<double>::infinity();
+  EXPECT_THROW(MissionController(bad, bank()), std::invalid_argument);
+}
+
+TEST_F(Mission, AfterRaceEndPointHoldsAtTheSentEndPointWithTheSetpointsYaw) {
+  MissionConfig sent = config(MissionType::Race, 1);
+  sent.course_source = rl_policy::CourseSource::RacePilot;
+  sent.after_race = AfterRace::EndPoint;
+  sent.hold_setpoint.position = Eigen::Vector3d(-2.0, 3.0, 1.5);
+  sent.hold_setpoint.yaw = 0.9;
+  const std::vector<double> xs = {4.8, 5.2, 9.8, 10.2, 14.8, 15.2, 4.8, 5.2};
+  const auto race_it = [&](const rl_policy::SentCourse & course) {
+      MissionController mission(sent, bank());
+      EXPECT_TRUE(mission.takeSentCourse(course).matches);
+      EXPECT_TRUE(mission.start());
+      StepResult last;
+      for (std::size_t i = 0; i < xs.size(); ++i) {
+        last = mission.step(at(xs[i], 0.0, 1.5), static_cast<double>(i) * kDt);
+      }
+      EXPECT_EQ(mission.phase(), Phase::Hold);
+      EXPECT_EQ(last.status.exit_reason, ExitReason::Finished);
+      const auto events = mission.takeEvents();
+      return std::make_pair(last, events.empty() ? MissionEvent() : events.back());
+    };
+
+  const rl_policy::SentCourse course = sentThreeGates(1);
+  ASSERT_TRUE(course.end_point.has_value());
+  const auto [last, finish] = race_it(course);
+  const Eigen::Vector3d end(20.0, 0.0, 1.5);
+  EXPECT_EQ(last.status.setpoint_source, SetpointSource::EndPoint);
+  EXPECT_EQ(last.status.setpoint.position, end);
+  EXPECT_DOUBLE_EQ(last.status.setpoint.yaw, 0.9);
+  EXPECT_EQ(last.frame.position, end);
+  EXPECT_EQ(last.status.policy, "hover");
+  EXPECT_EQ(finish.source, SetpointSource::EndPoint);
+  EXPECT_EQ(
+    rl_policy::describe(finish),
+    "Race finished: 1 laps, 4 gates (race -> hold): hold at the race pilot's end point "
+    "[20.000, 0.000, 1.500] yaw 0.900 rad with policy 'hover'");
+
+  // Clamped like every hold.
+  rl_policy::SentCourse far = course;
+  far.end_point = Eigen::Vector3d(40.0, -9.0, 0.2);
+  EXPECT_EQ(race_it(far).first.status.setpoint.position, Eigen::Vector3d(30.0, -5.0, 1.0));
+
+  // Without one, at hold.setpoint.
+  rl_policy::SentCourse none = course;
+  none.end_point.reset();
+  const StepResult configured = race_it(none).first;
+  EXPECT_EQ(configured.status.setpoint_source, SetpointSource::Configured);
+  EXPECT_EQ(configured.status.setpoint.position, Eigen::Vector3d(-2.0, 3.0, 1.5));
+  EXPECT_DOUBLE_EQ(configured.status.setpoint.yaw, 0.9);
+
+  // Every other exit holds where it happens.
+  MissionController mission(sent, bank());
+  ASSERT_TRUE(mission.takeSentCourse(course).matches);
+  ASSERT_TRUE(mission.start());
+  mission.step(at(4.8, 1.0, 1.5), 0.0);
+  const StepResult missed = mission.step(at(5.2, 1.0, 1.5), kDt);
+  EXPECT_EQ(missed.status.exit_reason, ExitReason::Missed);
+  EXPECT_EQ(missed.status.setpoint_source, SetpointSource::Here);
+  EXPECT_EQ(missed.status.setpoint.position, Eigen::Vector3d(5.2, 1.0, 1.5));
+}
+
+TEST_F(Mission, AfterRaceEndPointIsTheRacePilotsCoursesOnly) {
+  MissionConfig sent = config(MissionType::Race, 1);
+  sent.course_source = rl_policy::CourseSource::RacePilot;
+  sent.after_race = AfterRace::EndPoint;
+  EXPECT_NO_THROW(MissionController(sent, bank()));
+  // hold.setpoint is where it falls back to.
+  MissionConfig outside = sent;
+  outside.hold_setpoint.position = Eigen::Vector3d(30.5, 0.0, 1.5);
+  EXPECT_THROW(MissionController(outside, bank()), std::invalid_argument);
+
+  MissionConfig configured = sent;
+  configured.course_source = rl_policy::CourseSource::Configured;
+  try {
+    MissionController mission(configured, bank());
+    FAIL() << "end_point was accepted on a configured course";
+  } catch (const std::invalid_argument & e) {
+    EXPECT_NE(std::string(e.what()).find("course.source race_pilot"), std::string::npos)
+      << e.what();
+  }
+  MissionConfig hover_config = config(MissionType::Hover);
+  hover_config.after_race = AfterRace::EndPoint;
+  EXPECT_THROW(MissionController(hover_config, bank(false, true)), std::invalid_argument);
+
+  EXPECT_EQ(rl_policy::afterRaceFromString("end_point"), AfterRace::EndPoint);
+  EXPECT_STREQ(rl_policy::toString(AfterRace::EndPoint), "end_point");
+  EXPECT_STREQ(rl_policy::toString(SetpointSource::EndPoint), "end_point");
 }
 
 TEST_F(Mission, AConfiguredCourseTakesNoSentOne) {

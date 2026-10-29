@@ -104,6 +104,12 @@ SentCourse sentCourse(const std::vector<Waypoint> & waypoints)
     const WaypointId id = parseWaypointId(waypoint.id);
     if (!id.crossing) {
       ++course.ignored;
+      // expandMission() writes the track's end_point last, as "end".
+      if (&waypoint == &waypoints.back() && id.gate == kEndPointId &&
+        waypoint.position.allFinite())
+      {
+        course.end_point = waypoint.position;
+      }
       continue;
     }
     if (!waypoint.position.allFinite() || !std::isfinite(waypoint.yaw)) {

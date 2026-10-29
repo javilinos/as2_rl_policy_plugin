@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace rl_policy
@@ -24,6 +25,8 @@ struct Gate
   GateShape shape = GateShape::Square;
   // Nothing stands there to hit: a crossing outside the window is no pass and no miss.
   bool is_virtual = false;
+  // The gate's own pass window, in its shape's norm; unset, its shape's.
+  std::optional<double> pass_tolerance_m;
 };
 
 struct Bounds

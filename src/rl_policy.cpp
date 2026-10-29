@@ -29,6 +29,7 @@ const std::vector<std::string> & optionalInitParameters()
   static const std::vector<std::string> tails = {
     "course.gates_shape",
     "course.gates_virtual",
+    "course.gates_pass_tolerance_m",
     "course.source",
     "course.match_position_m",
     "course.match_yaw_deg",
@@ -307,6 +308,24 @@ void Plugin::readSettings(Settings & settings)
       mission.gates[i].is_virtual = values[i];
     }
   }
+  const auto * windows =
+    optionalSetting("course.gates_pass_tolerance_m", ParameterType::PARAMETER_DOUBLE_ARRAY);
+  if (windows && !mission.gates.empty()) {
+    const std::vector<double> values = windows->as_double_array();
+    if (values.size() != mission.gates.size()) {
+      refuse(
+        param("course.gates_pass_tolerance_m") + " has " + std::to_string(values.size()) +
+        " entries, the course has " + std::to_string(mission.gates.size()) + " gates");
+    }
+    for (std::size_t i = 0; i < values.size() && i < mission.gates.size(); ++i) {
+      if (!(std::isfinite(values[i]) && values[i] > 0.0)) {
+        refuse(
+          param("course.gates_pass_tolerance_m") + " entry " + std::to_string(i) + " is " +
+          text(values[i]) + ": a pass window must be finite and positive");
+      }
+      mission.gates[i].pass_tolerance_m = values[i];
+    }
+  }
   for (const auto & [tail, message] : removedParameters()) {
     if (getNodePtr()->has_parameter(param(tail))) {
       refuse(param(tail) + " " + message);
@@ -564,6 +583,22 @@ void Plugin::ownInitialize()
         "Pass windows, virtual gates alike: %zu squares max(|u|, |v|) < %.3f m "
         "(race.pass_tolerance_m)%s", course.size() - octagons,
         windows.passTolerance(GateShape::Square), octagon_pass);
+      std::string own;
+      for (std::size_t i = 0; i < course.size(); ++i) {
+        const Gate & gate = course.gate(i);
+        if (windows.passTolerance(gate) != windows.passTolerance(gate.shape)) {
+          char entry[48];
+          std::snprintf(
+            entry, sizeof(entry), "%sgate %zu %.3f m", own.empty() ? "" : ", ", i,
+            windows.passTolerance(gate));
+          own += entry;
+        }
+      }
+      if (!own.empty()) {
+        RCLCPP_INFO(
+          logger, "Gates with a pass window of their own (course.gates_pass_tolerance_m): %s",
+          own.c_str());
+      }
       char virtual_valid[80] = "";
       if (windows.virtual_valid_half_m) {
         std::snprintf(
@@ -595,6 +630,14 @@ void Plugin::ownInitialize()
         logger,
         "Stop check on: the race also exits when its predicted stop %s leaves the bounds or "
         "the ceiling (race.stop_latency_s, race.stop_decel_ms2)", stop);
+    }
+    if (config.after_race == AfterRace::EndPoint) {
+      const Gate & setpoint = config.hold_setpoint;
+      RCLCPP_INFO(
+        logger,
+        "The finish holds at the end point of the course the race pilot sends, yaw %.3f rad; at "
+        "[%.3f, %.3f, %.3f] when it sends none (hold.after_race end_point, hold.setpoint)",
+        setpoint.yaw, setpoint.position.x(), setpoint.position.y(), setpoint.position.z());
     }
     if (config.type == MissionType::Hover) {
       const Gate & setpoint = mission_->status().setpoint;
@@ -825,6 +868,19 @@ void Plugin::takeRacePilotCourse(const as2_msgs::msg::TrajectorySetpoints & ref)
         "circuit within %.3f m and %.2f deg; %zu other waypoints ignored", course.crossings.size(),
         course.laps, course.lap_size, extra.c_str(), match.max_position_error_m,
         match.max_yaw_error_rad * 180.0 / kPi, course.ignored);
+      if (mission_->config().after_race == AfterRace::EndPoint) {
+        const Gate & setpoint = mission_->config().hold_setpoint;
+        if (course.end_point) {
+          RCLCPP_INFO(
+            logger, "The finish holds at the course's end point [%.3f, %.3f, %.3f]",
+            course.end_point->x(), course.end_point->y(), course.end_point->z());
+        } else {
+          RCLCPP_WARN(
+            logger,
+            "The course has no end point: the finish holds at hold.setpoint [%.3f, %.3f, %.3f]",
+            setpoint.position.x(), setpoint.position.y(), setpoint.position.z());
+        }
+      }
     } else {
       course_state_ = "refused: " + match.reason;
       RCLCPP_ERROR(

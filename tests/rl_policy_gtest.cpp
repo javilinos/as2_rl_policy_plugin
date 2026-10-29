@@ -683,7 +683,9 @@ TEST_F(PluginTest, AfterRaceIsHereOrASetpointInsideTheBounds) {
   build(with(inside, after_race("start")));
   EXPECT_FALSE(plugin_->isReady());
   EXPECT_FALSE(plugin_->setMode(kTrajectory, kBodyRates));
-  EXPECT_NE(statusMessage().find("'start' is neither 'here' nor 'setpoint'"), std::string::npos);
+  EXPECT_NE(
+    statusMessage().find("'start' is neither 'here', 'setpoint' nor 'end_point'"),
+    std::string::npos);
 
   build(with(inside, rclcpp::Parameter("rl_policy.hold.after_race", 1)));
   EXPECT_FALSE(plugin_->isReady());
@@ -1206,6 +1208,66 @@ TEST_F(PluginTest, ARacePilotCourseIsRacedOnceALapMatchesTheConfiguredGates) {
   EXPECT_EQ(status["course_source"], "race_pilot");
   EXPECT_EQ(status["course"], "matched");
   EXPECT_EQ(status["course_crossings"], "25");
+}
+
+TEST_F(PluginTest, ReadsEachGatesOwnPassWindowAndRefusesOnesThatDoNotFit) {
+  const auto parameters = flightParameters(rl_policy_test::fixturePath(kPolicyFixture));
+  const auto windows = [](const std::vector<double> & values) {
+      return rclcpp::Parameter("rl_policy.course.gates_pass_tolerance_m", values);
+    };
+  std::vector<double> own(12, 0.75);
+  own[3] = 1.35;
+  build(with(parameters, windows(own)));
+  ASSERT_TRUE(plugin_->isReady());
+  const rl_policy::Course & course = plugin_->mission()->sequencer().course();
+  const rl_policy::SequencerConfig & sequencer = plugin_->mission()->sequencer().config();
+  EXPECT_DOUBLE_EQ(sequencer.passTolerance(course.gate(3)), 1.35);
+  EXPECT_DOUBLE_EQ(sequencer.passTolerance(course.gate(0)), 0.75);
+
+  build(parameters);
+  ASSERT_TRUE(plugin_->isReady());
+  for (const rl_policy::Gate & gate : plugin_->mission()->config().gates) {
+    EXPECT_FALSE(gate.pass_tolerance_m.has_value());
+  }
+
+  build(with(parameters, windows(std::vector<double>(11, 0.75))));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(
+    statusMessage().find("course.gates_pass_tolerance_m has 11 entries, the course has 12 gates"),
+    std::string::npos);
+  own[3] = 0.0;
+  build(with(parameters, windows(own)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(
+    statusMessage().find("course.gates_pass_tolerance_m entry 3 is 0.000000"), std::string::npos);
+  build(
+    with(
+      parameters,
+      rclcpp::Parameter("rl_policy.course.gates_pass_tolerance_m", std::vector<int64_t>(12, 1))));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("write every value with a decimal point"), std::string::npos);
+}
+
+TEST_F(PluginTest, AfterRaceEndPointTakesTheRacePilotsEndPoint) {
+  const auto parameters = with(
+    with(
+      flightParameters(rl_policy_test::fixturePath(kPolicyFixture)),
+      rclcpp::Parameter("rl_policy.hold.after_race", std::string("end_point"))),
+    rclcpp::Parameter("rl_policy.hold.setpoint", std::vector<double>{14.5, 2.0, 1.45, 0.5}));
+  build(with(parameters, rclcpp::Parameter("rl_policy.course.source", std::string("race_pilot"))));
+  ASSERT_TRUE(plugin_->isReady());
+  EXPECT_EQ(plugin_->mission()->config().after_race, rl_policy::AfterRace::EndPoint);
+  plugin_->updateReference(sentSeasonTwo(2));
+  ASSERT_TRUE(plugin_->mission()->courseReady());
+  const auto & sent = plugin_->mission()->sentCourse();
+  ASSERT_TRUE(sent.has_value());
+  ASSERT_TRUE(sent->end_point.has_value());
+  EXPECT_EQ(*sent->end_point, Eigen::Vector3d(10.0, 2.0, 1.45));
+
+  // Only on the race pilot's course.
+  build(parameters);
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("course.source race_pilot"), std::string::npos);
 }
 
 int main(int argc, char ** argv)

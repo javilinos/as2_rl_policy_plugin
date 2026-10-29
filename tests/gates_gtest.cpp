@@ -602,6 +602,39 @@ TEST(VirtualGate, ItsValidWindowIsItsShapesUnlessGivenAndMustBeAWindow) {
   EXPECT_STREQ(rl_policy::toString(GateShape::Octagon), "octagon");
 }
 
+TEST(Sequencer, AGateWithAWindowOfItsOwnIsJudgedInItNotInItsShapes) {
+  const rl_policy::SequencerConfig config = windowConfig(1, 0.75, 0.6);
+  // A powerloop's top: a virtual square passed inside the whole frame its network trained on.
+  Gate top;
+  top.is_virtual = true;
+  top.pass_tolerance_m = 1.35;
+  EXPECT_DOUBLE_EQ(config.passTolerance(top), 1.35);
+  EXPECT_DOUBLE_EQ(config.passTolerance(Gate()), 0.75);
+  const auto through = [&config](const Gate & gate, double lateral, double vertical) {
+      GateSequencer sequencer(Course(std::vector<Gate>{gate}), config);
+      return sequencer.update(
+        inGate(gate, -0.2, lateral, vertical), inGate(gate, 0.2, lateral, vertical)).event;
+    };
+  EXPECT_EQ(through(top, 1.3, -1.3), GateEvent::Finished);
+  EXPECT_EQ(through(top, 0.0, 1.35), GateEvent::Outside);
+  // Narrower than its shape's too: a physical gate misses outside it.
+  Gate physical;
+  physical.pass_tolerance_m = 0.5;
+  EXPECT_EQ(through(physical, 0.45, 0.0), GateEvent::Finished);
+  EXPECT_EQ(through(physical, 0.6, 0.0), GateEvent::Missed);
+  // In its shape's norm: an octagon's corner is cut off at (|u| + |v|) / sqrt(2).
+  Gate octagon;
+  octagon.shape = GateShape::Octagon;
+  octagon.pass_tolerance_m = 1.0;
+  EXPECT_EQ(through(octagon, 0.95, 0.0), GateEvent::Finished);
+  EXPECT_EQ(through(octagon, 0.75, 0.75), GateEvent::Missed);
+
+  top.pass_tolerance_m = 0.0;
+  EXPECT_THROW(GateSequencer(Course(std::vector<Gate>{top}), config), std::invalid_argument);
+  top.pass_tolerance_m = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_THROW(GateSequencer(Course(std::vector<Gate>{top}), config), std::invalid_argument);
+}
+
 TEST(Sequencer, TotalCrossingsFinishOnTheLastOneNotOnTheLaps) {
   const std::size_t n = seasonTwo().size();
   rl_policy::SequencerConfig config = sequencerConfig(2);

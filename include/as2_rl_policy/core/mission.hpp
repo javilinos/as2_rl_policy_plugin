@@ -47,11 +47,13 @@ enum class ExitReason
   HoverRequest,
 };
 
-// Where the race's finish holds: the pose it ends at, or the hold setpoint.
+// Where the race's finish holds: the pose it ends at, the hold setpoint, or the end point of the
+// course the race pilot sent at the setpoint's yaw (the setpoint itself when it sent none).
 enum class AfterRace
 {
   Here,
   Setpoint,
+  EndPoint,
 };
 
 // What the hover mission holds: the last sent reference, else hold.setpoint; or hold.setpoint.
@@ -61,13 +63,15 @@ enum class HoldReference
   Configured,
 };
 
-// Where a hold setpoint came from: hold.setpoint, a sent reference or the pose at the time.
+// Where a hold setpoint came from: hold.setpoint, a sent reference, the pose at the time or the
+// sent course's end point.
 enum class SetpointSource
 {
   None,
   Configured,
   Sent,
   Here,
+  EndPoint,
 };
 
 // Where the race's course comes from: course.gates_*, or as2_race_pilot's sent course, which has
@@ -109,7 +113,7 @@ CourseSource courseSourceFromString(const std::string & name);
 // Throws std::invalid_argument for anything but "race" or "hover".
 MissionType missionTypeFromString(const std::string & name);
 
-// Throws std::invalid_argument for anything but "here" or "setpoint".
+// Throws std::invalid_argument for anything but "here", "setpoint" or "end_point".
 AfterRace afterRaceFromString(const std::string & name);
 
 // Throws std::invalid_argument for anything but "sent_or_configured" or "configured".
@@ -118,7 +122,8 @@ HoldReference holdReferenceFromString(const std::string & name);
 struct MissionConfig
 {
   MissionType type = MissionType::Race;
-  // The race's course, and with a sent one the circuit it is matched against.
+  // The race's course, and with a sent one the circuit it is matched against, whose gates' own
+  // pass windows the sent gates take.
   std::vector<Gate> gates;
   CourseSource course_source = CourseSource::Configured;
   // A sent course's gates match the configured ones within these.
@@ -247,7 +252,8 @@ public:
   ReferenceUpdate updateHoldReference(double x, double y, double z, double yaw);
 
   // Idle, a race mission on a sent course: races it when one lap matches course.gates_*, with
-  // the sent gates' poses, and finishes on its last crossing. A mismatch leaves no course.
+  // the sent gates' poses and the configured gates' own windows, and finishes on its last
+  // crossing. A mismatch leaves no course.
   CourseMatch takeSentCourse(const SentCourse & course);
 
   // The race can start: a configured course, or a sent one that matched.

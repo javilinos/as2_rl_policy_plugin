@@ -17,7 +17,7 @@
       motor_speed:
         topic: sensor_measurements/motor_angular_speed # sensor_msgs/JointState, velocity in rad/s in the policy's motor order
         timeout_s: 0.1
-      course: # timed gates in pass order, world ENU, yaw in rad; optional gates_shape (0 square, 1 octagon) and gates_virtual (true: nothing to hit)
+      course: # timed gates in pass order, world ENU, yaw in rad; optional gates_shape (0 square, 1 octagon), gates_virtual (true: nothing to hit) and gates_pass_tolerance_m (a gate's own pass window)
         gates_x: [12.5, 6.5]
         gates_y: [2.0, 6.0]
         gates_z: [1.45, 1.45]
@@ -36,10 +36,10 @@
         ceiling_m: 10.0
         exit_debounce_steps: 3
       hold:
-        setpoint: [0.0, 0.0, 1.5, 0.0] # x, y, z, yaw: the hover mission's hold while no reference is sent, and after_race: setpoint's
+        setpoint: [0.0, 0.0, 1.5, 0.0] # x, y, z, yaw: the hover mission's hold while no reference is sent, after_race: setpoint's, and end_point's yaw and fallback
         reference: sent_or_configured # sent_or_configured: the hover mission holds the last point of a sent trajectory reference, else setpoint | configured: setpoint
         min_altitude_m: 1.0
-        after_race: here # here | setpoint: where the race's finish holds
+        after_race: here # here | setpoint | end_point: where the race's finish holds (end_point: race_pilot's end point at setpoint's yaw, setpoint without one)
       debug:
         status_topic: rl_policy/status # "" disables
         step_topic: rl_policy/step # "" disables

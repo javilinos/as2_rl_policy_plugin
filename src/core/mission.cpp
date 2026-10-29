@@ -94,6 +94,8 @@ const char * toString(AfterRace after_race)
       return "here";
     case AfterRace::Setpoint:
       return "setpoint";
+    case AfterRace::EndPoint:
+      return "end_point";
   }
   return "unknown";
 }
@@ -120,6 +122,8 @@ const char * toString(SetpointSource source)
       return "sent";
     case SetpointSource::Here:
       return "here";
+    case SetpointSource::EndPoint:
+      return "end_point";
   }
   return "unknown";
 }
@@ -166,7 +170,11 @@ AfterRace afterRaceFromString(const std::string & name)
   if (name == toString(AfterRace::Setpoint)) {
     return AfterRace::Setpoint;
   }
-  throw std::invalid_argument("after_race '" + name + "' is neither 'here' nor 'setpoint'");
+  if (name == toString(AfterRace::EndPoint)) {
+    return AfterRace::EndPoint;
+  }
+  throw std::invalid_argument(
+          "after_race '" + name + "' is neither 'here', 'setpoint' nor 'end_point'");
 }
 
 HoldReference holdReferenceFromString(const std::string & name)
@@ -243,8 +251,10 @@ std::string describe(const MissionEvent & event)
       break;
   }
   return cause + format(
-    " (%s -> %s): hold at [%.3f, %.3f, %.3f] yaw %.3f rad with policy '%s'",
-    toString(event.from), toString(event.to), event.setpoint.position.x(),
+    " (%s -> %s): hold at %s[%.3f, %.3f, %.3f] yaw %.3f rad with policy '%s'",
+    toString(event.from), toString(event.to),
+    event.source == SetpointSource::EndPoint ? "the race pilot's end point " : "",
+    event.setpoint.position.x(),
     event.setpoint.position.y(), event.setpoint.position.z(), event.setpoint.yaw,
     event.policy.c_str());
 }
@@ -270,6 +280,10 @@ MissionConfig MissionController::validated(MissionConfig config, const PolicyBan
   require(!config.gates.empty(), "the course needs at least one gate");
   for (const Gate & gate : config.gates) {
     require(finite(gate), "the course has a non-finite gate");
+    require(
+      !gate.pass_tolerance_m ||
+      (std::isfinite(*gate.pass_tolerance_m) && *gate.pass_tolerance_m > 0.0),
+      "course.gates_pass_tolerance_m must be finite and positive");
   }
   const Bounds & bounds = config.bounds;
   require(
@@ -302,10 +316,18 @@ MissionConfig MissionController::validated(MissionConfig config, const PolicyBan
     std::isfinite(config.stop_decel_ms2) && config.stop_decel_ms2 >= 0.0,
     "race.stop_decel_ms2 must be finite and not negative");
   require(finite(config.hold_setpoint), "hold.setpoint must be finite");
-  if (config.type == MissionType::Race && config.after_race == AfterRace::Setpoint) {
+  if (config.after_race == AfterRace::EndPoint) {
+    require(
+      config.type == MissionType::Race && config.course_source == CourseSource::RacePilot,
+      "hold.after_race end_point holds at the end point of the course as2_race_pilot sends: "
+      "the race mission on course.source race_pilot only");
+  }
+  if (config.type == MissionType::Race && config.after_race != AfterRace::Here) {
+    // The end point's hold falls back to it when the sent course has none.
     require(
       bounds.contains(config.hold_setpoint.position.x(), config.hold_setpoint.position.y()),
-      "hold.after_race is setpoint, so hold.setpoint must lie inside the course bounds in x and y");
+      std::string("hold.after_race is ") + toString(config.after_race) +
+      ", so hold.setpoint must lie inside the course bounds in x and y");
   }
   require(std::isfinite(config.min_altitude_m), "hold.min_altitude_m must be finite");
   require(
@@ -376,8 +398,13 @@ CourseMatch MissionController::takeSentCourse(const SentCourse & course)
     return match;
   }
   sent_course_ = course;
+  // Matched gate by gate, so each sent gate is its configured one and takes its window.
+  std::vector<Gate> lap = course.lap();
+  for (std::size_t i = 0; i < lap.size(); ++i) {
+    lap[i].pass_tolerance_m = config_.gates[i].pass_tolerance_m;
+  }
   sequencer_ = GateSequencer(
-    Course(course.lap(), config_.bounds),
+    Course(std::move(lap), config_.bounds),
     sequencerConfig(static_cast<int>(course.crossings.size())));
   return match;
 }
@@ -563,7 +590,7 @@ void MissionController::raceChecks(const VehicleState & state)
       event.valid = update.valid;
       event.is_virtual = gate.is_virtual;
       event.shape = gate.shape;
-      event.window_m = sequencer_.config().passTolerance(gate.shape);
+      event.window_m = sequencer_.config().passTolerance(gate);
       events_.push_back(event);
     }
     switch (update.event) {
@@ -619,13 +646,20 @@ void MissionController::exitRace(
   event.valid = update.valid;
   event.since_pass_s = static_cast<double>(sequencer_.stepsSincePass()) * dt();
   event.position = state.position;
-  const bool to_setpoint =
-    reason == ExitReason::Finished && config_.after_race == AfterRace::Setpoint;
-  const Gate pose = to_setpoint ? config_.hold_setpoint :
-    Gate{state.position, yawFromQuaternion(state.orientation)};
+  Gate pose{state.position, yawFromQuaternion(state.orientation)};
+  SetpointSource source = SetpointSource::Here;
+  if (reason == ExitReason::Finished && config_.after_race != AfterRace::Here) {
+    pose = config_.hold_setpoint;
+    source = SetpointSource::Configured;
+    if (config_.after_race == AfterRace::EndPoint && sent_course_ && sent_course_->end_point) {
+      // The end point has no yaw: the setpoint's.
+      pose.position = *sent_course_->end_point;
+      source = SetpointSource::EndPoint;
+    }
+  }
   hold(
-    clampSetpoint(pose.position.x(), pose.position.y(), pose.position.z(), pose.yaw),
-    to_setpoint ? SetpointSource::Configured : SetpointSource::Here, reason, event);
+    clampSetpoint(pose.position.x(), pose.position.y(), pose.position.z(), pose.yaw), source,
+    reason, event);
 }
 
 void MissionController::hold(

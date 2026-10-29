@@ -4,6 +4,7 @@
 #include <Eigen/Dense>
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -36,6 +37,9 @@ struct WaypointId
 
 WaypointId parseWaypointId(const std::string & id);
 
+// The id as2_race_pilot gives the course's last point, the track's end_point.
+inline constexpr const char kEndPointId[] = "end";
+
 // The stack's rule: a gate whose name contains "_v" is virtual.
 bool isVirtualGateName(const std::string & name);
 
@@ -54,13 +58,15 @@ struct SentCourse
   std::size_t extra = 0;
   // The points that are no crossing: the vehicle, the start, pass-through points, the end.
   std::size_t ignored = 0;
+  // The last point when it is the track's end_point (id "end") and finite; it carries no yaw.
+  std::optional<Eigen::Vector3d> end_point;
 
   std::vector<Gate> lap() const;
 
   std::vector<std::string> lapNames() const;
 };
 
-// Every _gp point as a gate, the MPCC's other marks and points dropped. Throws
+// Every _gp point as a gate, the MPCC's other marks and points dropped but the end point. Throws
 // std::invalid_argument when there is no crossing or one is not finite.
 SentCourse sentCourse(const std::vector<Waypoint> & waypoints);
 
