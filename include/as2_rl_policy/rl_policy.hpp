@@ -11,6 +11,7 @@
 #include <diagnostic_msgs/msg/diagnostic_status.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/twist_stamped.hpp>
+#include <geometry_msgs/msg/vector3_stamped.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 
@@ -29,6 +30,9 @@ namespace rl_policy
 inline constexpr const char kStepLabel[] = "rl_policy_step_v2";
 inline constexpr std::size_t kStepColumns = 64;
 inline constexpr std::size_t kStepObservationColumns = 31;
+
+// gate_offset.topic's default, under the controller's namespace.
+inline constexpr const char kGateOffsetTopic[] = "rl_policy/gate_offset";
 
 class Plugin : public as2_motion_controller_plugin_base::ControllerBase
 {
@@ -84,6 +88,9 @@ private:
     bool policies_named = false;
     std::string motor_speed_topic;
     double motor_speed_timeout_s = 0.0;
+    std::string gate_offset_topic = kGateOffsetTopic;
+    std::size_t gate_offset_gate = 0;
+    double gate_offset_timeout_s = 0.1;
   };
 
   void readSettings(Settings & settings);
@@ -96,6 +103,11 @@ private:
   void refuse(const std::string & reason);
 
   void motorSpeedCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
+
+  void gateOffsetCallback(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg);
+
+  // gate_offset.topic: the last offset into the race's observation while it is fresh, none after.
+  void applyGateOffset(const rclcpp::Time & now);
 
   // course.source race_pilot: the race's course from as2_race_pilot's trajectory, while idle.
   void takeRacePilotCourse(const as2_msgs::msg::TrajectorySetpoints & ref);
@@ -131,6 +143,14 @@ private:
   bool motor_speed_stale_ = false;
   std::uint64_t stale_steps_ = 0;
 
+  // gate_offset.topic's last offset, gate-local [through, left, up], m.
+  std::size_t gate_offset_gate_ = 0;
+  double gate_offset_timeout_s_ = 0.0;
+  Eigen::Vector3d gate_offset_ = Eigen::Vector3d::Zero();
+  bool gate_offset_received_ = false;
+  bool gate_offset_applied_ = false;
+  rclcpp::Time gate_offset_stamp_{0, 0, RCL_ROS_TIME};
+
   // The last policy step, replayed to a call that comes early.
   Command held_command_;
   bool has_held_command_ = false;
@@ -147,6 +167,7 @@ private:
   std::string course_state_ = "configured";
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr motor_speed_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Vector3Stamped>::SharedPtr gate_offset_sub_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr step_pub_;
   rclcpp::TimerBase::SharedPtr status_timer_;

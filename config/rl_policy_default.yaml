@@ -17,6 +17,10 @@
       motor_speed:
         topic: sensor_measurements/motor_angular_speed # sensor_msgs/JointState, velocity in rad/s in the policy's motor order
         timeout_s: 0.1
+      gate_offset: # a detector's move of one gate's middle point, for the race's observation only (README: Gate offset)
+        topic: rl_policy/gate_offset # geometry_msgs/Vector3Stamped, gate-local [through, left, up] m; empty: off
+        gate: 0 # the lap's gate it moves
+        timeout_s: 0.1 # s a message is applied; older, the gate is observed where it stands
       course: # timed gates in pass order, world ENU, yaw in rad; optional gates_shape (0 square, 1 octagon), gates_virtual (true: nothing to hit) and gates_pass_tolerance_m (a gate's own pass window)
         gates_x: [12.5, 6.5]
         gates_y: [2.0, 6.0]

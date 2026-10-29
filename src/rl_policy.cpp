@@ -38,6 +38,9 @@ const std::vector<std::string> & optionalInitParameters()
     "race.virtual_valid_half_m",
     "race.stop_latency_s",
     "race.stop_decel_ms2",
+    "gate_offset.topic",
+    "gate_offset.gate",
+    "gate_offset.timeout_s",
   };
   return tails;
 }
@@ -396,6 +399,23 @@ void Plugin::readSettings(Settings & settings)
   if (const auto * p = optionalSetting("race.stop_decel_ms2", ParameterType::PARAMETER_DOUBLE)) {
     mission.stop_decel_ms2 = p->as_double();
   }
+  if (const auto * p = optionalSetting("gate_offset.topic", ParameterType::PARAMETER_STRING)) {
+    settings.gate_offset_topic = p->as_string();
+  }
+  if (const auto * p = optionalSetting("gate_offset.gate", ParameterType::PARAMETER_INTEGER)) {
+    if (p->as_int() < 0) {
+      refuse(
+        param("gate_offset.gate") + " is " + std::to_string(p->as_int()) + ": a gate of the lap");
+    } else {
+      settings.gate_offset_gate = static_cast<std::size_t>(p->as_int());
+    }
+  }
+  if (const auto * p = optionalSetting("gate_offset.timeout_s", ParameterType::PARAMETER_DOUBLE)) {
+    settings.gate_offset_timeout_s = p->as_double();
+    if (!(settings.gate_offset_timeout_s > 0.0)) {
+      refuse(param("gate_offset.timeout_s") + " must be positive");
+    }
+  }
   if (const auto * p = setting("race.gate_timeout_s", ParameterType::PARAMETER_DOUBLE)) {
     mission.gate_timeout_s = p->as_double();
   }
@@ -434,6 +454,13 @@ void Plugin::readSettings(Settings & settings)
     } catch (const std::invalid_argument & e) {
       refuse(param("hold.reference") + ": " + e.what());
     }
+  }
+  if (mission.type == MissionType::Race && !settings.gate_offset_topic.empty() &&
+    !mission.gates.empty() && settings.gate_offset_gate >= mission.gates.size())
+  {
+    refuse(
+      param("gate_offset.gate") + " is " + std::to_string(settings.gate_offset_gate) +
+      ", the lap has " + std::to_string(mission.gates.size()) + " gates");
   }
 }
 
@@ -544,6 +571,13 @@ void Plugin::ownInitialize()
       std::bind(&Plugin::motorSpeedCallback, this, std::placeholders::_1));
     ready_ = true;
     const MissionConfig & config = mission_->config();
+    gate_offset_gate_ = settings.gate_offset_gate;
+    gate_offset_timeout_s_ = settings.gate_offset_timeout_s;
+    if (config.type == MissionType::Race && !settings.gate_offset_topic.empty()) {
+      gate_offset_sub_ = getNodePtr()->create_subscription<geometry_msgs::msg::Vector3Stamped>(
+        settings.gate_offset_topic, rclcpp::SensorDataQoS(),
+        std::bind(&Plugin::gateOffsetCallback, this, std::placeholders::_1));
+    }
     RCLCPP_INFO(
       logger,
       "rl_policy ready: %s mission, %zu gates, %d laps, step %.4f s, motor speeds from '%s'",
@@ -630,6 +664,14 @@ void Plugin::ownInitialize()
         logger,
         "Stop check on: the race also exits when its predicted stop %s leaves the bounds or "
         "the ceiling (race.stop_latency_s, race.stop_decel_ms2)", stop);
+    }
+    if (gate_offset_sub_) {
+      RCLCPP_INFO(
+        logger,
+        "Gate %zu's middle point moves in the race's observation by the offset on '%s', "
+        "gate-local [through, left, up] m, for %.3f s after each message (gate_offset.topic, "
+        "gate_offset.gate, gate_offset.timeout_s); its passes are judged where it stands",
+        gate_offset_gate_, gate_offset_sub_->get_topic_name(), gate_offset_timeout_s_);
     }
     if (config.after_race == AfterRace::EndPoint) {
       const Gate & setpoint = config.hold_setpoint;
@@ -963,6 +1005,7 @@ bool Plugin::computeOutput(
       mission_->start();
       handleMissionEvents();
     }
+    applyGateOffset(now);
     result = mission_->step(state_, now.seconds());
   } catch (const std::exception & e) {
     RCLCPP_ERROR_THROTTLE(logger, clock, 1000, "Policy step failed: %s", e.what());
@@ -999,6 +1042,48 @@ void Plugin::motorSpeedCallback(const sensor_msgs::msg::JointState::SharedPtr ms
     RCLCPP_INFO(
       getNodePtr()->get_logger(), "Motor speeds received on '%s'",
       motor_speed_sub_->get_topic_name());
+  }
+}
+
+void Plugin::gateOffsetCallback(const geometry_msgs::msg::Vector3Stamped::SharedPtr msg)
+{
+  const Eigen::Vector3d offset(msg->vector.x, msg->vector.y, msg->vector.z);
+  if (!offset.allFinite()) {
+    RCLCPP_WARN_THROTTLE(
+      getNodePtr()->get_logger(), *getNodePtr()->get_clock(), 1000,
+      "A gate offset on '%s' is not finite: ignored", gate_offset_sub_->get_topic_name());
+    return;
+  }
+  gate_offset_ = offset;
+  gate_offset_stamp_ = getNodePtr()->now();
+  gate_offset_received_ = true;
+}
+
+void Plugin::applyGateOffset(const rclcpp::Time & now)
+{
+  if (!gate_offset_sub_) {
+    return;
+  }
+  const bool fresh = gate_offset_received_ &&
+    (now - gate_offset_stamp_).seconds() <= gate_offset_timeout_s_;
+  if (fresh) {
+    mission_->setGateOffset(gate_offset_gate_, gate_offset_);
+  } else {
+    mission_->clearGateOffset();
+  }
+  if (fresh != gate_offset_applied_) {
+    gate_offset_applied_ = fresh;
+    if (fresh) {
+      RCLCPP_INFO(
+        getNodePtr()->get_logger(), "Gate %zu's offset applied: [%.3f, %.3f, %.3f] m",
+        gate_offset_gate_, gate_offset_.x(), gate_offset_.y(), gate_offset_.z());
+    } else {
+      RCLCPP_INFO(
+        getNodePtr()->get_logger(),
+        "Gate %zu's offset is older than %.3f s: the observation sees the gate where it stands",
+        gate_offset_gate_, gate_offset_timeout_s_);
+    }
+    publishStatus();
   }
 }
 
@@ -1190,6 +1275,19 @@ diagnostic_msgs::msg::DiagnosticStatus Plugin::statusMessage() const
   msg.values.push_back(keyValue("motor_speed_age_s", text(motor_speed_age_s)));
   msg.values.push_back(keyValue("motor_speed_stale", text(motor_speed_stale_)));
   msg.values.push_back(keyValue("motor_speed_stale_steps", std::to_string(stale_steps_)));
+  if (gate_offset_sub_) {
+    const auto & applied = mission_->gateOffset();
+    msg.values.push_back(keyValue("gate_offset_gate", std::to_string(gate_offset_gate_)));
+    msg.values.push_back(keyValue("gate_offset_applied", text(applied.has_value())));
+    static const char * const kAxes[] = {
+      "gate_offset_through", "gate_offset_left", "gate_offset_up"};
+    for (int axis = 0; axis < 3; ++axis) {
+      msg.values.push_back(keyValue(kAxes[axis], text(applied ? applied->offset(axis) : 0.0)));
+    }
+    const double age = gate_offset_received_ ?
+      (getNodePtr()->now() - gate_offset_stamp_).seconds() : nan;
+    msg.values.push_back(keyValue("gate_offset_age_s", text(age)));
+  }
   msg.values.push_back(keyValue("last_event", last_event_));
   return msg;
 }

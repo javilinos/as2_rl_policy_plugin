@@ -1459,3 +1459,43 @@ TEST_F(Mission, CourseSourceNames) {
   bad.match_position_m = 0.0;
   EXPECT_THROW(MissionController(bad, bank()), std::invalid_argument);
 }
+
+TEST_F(Mission, AGateOffsetMovesTheObservedGateNotTheOneItsPassIsJudgedAt) {
+  MissionController mission(config(), bank());
+  mission.start();
+  EXPECT_FALSE(mission.setGateOffset(3, Eigen::Vector3d(0.0, 0.3, 0.2)));
+  EXPECT_FALSE(
+    mission.setGateOffset(0, Eigen::Vector3d(0.0, std::numeric_limits<double>::quiet_NaN(), 0.0)));
+  EXPECT_FALSE(mission.gateOffset().has_value());
+
+  // Gate 0 at (5, 0, 1.5), yaw 0: 0.3 m left and 0.2 m up of its middle.
+  ASSERT_TRUE(mission.setGateOffset(0, Eigen::Vector3d(0.0, 0.3, 0.2)));
+  const StepResult approach = mission.step(at(4.0, 0.0, 1.5), 0.00);
+  EXPECT_EQ(approach.frame.position, Eigen::Vector3d(5.0, 0.3, 1.7));
+  EXPECT_EQ(approach.observation(0), f32(4.0 - 5.0));
+  EXPECT_EQ(approach.observation(1), f32(0.0 - 0.3));
+  EXPECT_EQ(approach.observation(2), f32(1.5 - 1.7));
+  // The next-gate entries: gate 1 at (10, 0, 1.5) from the moved middle.
+  EXPECT_EQ(approach.observation(16), f32(5.0));
+  EXPECT_EQ(approach.observation(17), f32(-0.3));
+  EXPECT_EQ(approach.observation(18), f32(-0.2));
+
+  // Gate-local: gate 2 faces +y, so its left is -x.
+  MissionConfig turned = config();
+  turned.gates[2].yaw = rl_policy::kPi / 2.0;
+  const rl_policy::Course moved = rl_policy::offsetCourse(
+    rl_policy::Course(turned.gates), rl_policy::GateOffset{2, Eigen::Vector3d(0.1, 0.3, 0.0)});
+  EXPECT_TRUE(moved.gate(2).position.isApprox(Eigen::Vector3d(15.0 - 0.3, 0.1, 1.5)));
+  EXPECT_EQ(moved.gate(0).position, turned.gates[0].position);
+
+  // 0.7 m right of the real middle, 1.0 m from the moved one: passed in the 0.9 m window where
+  // the gate stands.
+  mission.step(at(4.9, -0.7, 1.5), 0.01);
+  const StepResult crossing = mission.step(at(5.1, -0.7, 1.5), 0.02);
+  EXPECT_EQ(crossing.status.gates_passed, 1);
+  EXPECT_NEAR(crossing.status.last_crossing.crossing.lateral, -0.7, 1e-9);
+  // Gate 1 is observed where it stands, and so is gate 0 once the offset is cleared.
+  EXPECT_EQ(crossing.frame.position, Eigen::Vector3d(10.0, 0.0, 1.5));
+  mission.clearGateOffset();
+  EXPECT_FALSE(mission.gateOffset().has_value());
+}

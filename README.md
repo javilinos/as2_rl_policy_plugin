@@ -89,6 +89,20 @@ the race pilot's end point, `none`) and
 The last crossing is `last_crossing_gate`, `_lateral_m`, `_vertical_m`, `_passed`, `_valid` and
 `_virtual`, beside the square windows `pass_tolerance_m` and `valid_half_m`.
 
+## Gate offset
+
+A detector that sees part of a gate's opening blocked can move the gate's middle point for the
+race policy: `gate_offset.topic` (default `rl_policy/gate_offset`, under the drone namespace; empty
+turns it off) carries a `geometry_msgs/Vector3Stamped` whose `vector` is the offset in the gate's
+own axes, [through, left, up] in m, for gate `gate_offset.gate` of the lap (default 0, the first
+gate). While a message is at most `gate_offset.timeout_s` old (default 0.1 s, five periods of a
+50 Hz detector), the race's observation sees that gate moved: its position entries as the target,
+and the next-gate entries that name it. The sequencer still judges the gate where it stands, in
+its own window, and a hold ignores the offset. The step topic's target frame is the moved gate,
+so a recorded flight carries each applied offset; the status carries `gate_offset_applied`,
+`gate_offset_through/left/up` and `gate_offset_age_s`. The policies never trained on a moved
+gate: this is a test of how they take one.
+
 ## Hold reference
 
 The hover mission holds `hold.setpoint` until a reference is sent. With

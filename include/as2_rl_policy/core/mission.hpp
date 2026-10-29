@@ -226,6 +226,17 @@ struct MissionEvent
 
 std::string describe(const MissionEvent & event);
 
+// A gate's middle point, moved for the observation only.
+struct GateOffset
+{
+  std::size_t gate = 0;
+  // Gate-local [through, left, up], m.
+  Eigen::Vector3d offset = Eigen::Vector3d::Zero();
+};
+
+// The course with gate `offset.gate`'s position moved by its offset, rotated by the gate's yaw.
+Course offsetCourse(const Course & course, const GateOffset & offset);
+
 struct StepResult
 {
   double t = 0.0;
@@ -258,6 +269,17 @@ public:
 
   // The race can start: a configured course, or a sent one that matched.
   bool courseReady() const;
+
+  // The race's observation sees gate `gate` of the lap with its middle point moved by `offset`,
+  // in the gate's own axes [through, left, up], m: where a detector aims inside an opening part
+  // blocked. The sequencer still judges the gate where it stands, and a hold ignores the
+  // offset. False, and nothing changed, for a gate outside the lap or a non-finite offset.
+  bool setGateOffset(std::size_t gate, const Eigen::Vector3d & offset);
+
+  void clearGateOffset() {gate_offset_.reset();}
+
+  // The offset the next race step applies, if any.
+  const std::optional<GateOffset> & gateOffset() const {return gate_offset_;}
 
   // One policy step, exactly one act() of the active policy.
   StepResult step(const VehicleState & state, double t);
@@ -321,6 +343,7 @@ private:
   std::optional<Gate> sent_reference_;
   std::optional<SentCourse> sent_course_;
   std::optional<CourseMatch> last_match_;
+  std::optional<GateOffset> gate_offset_;
   std::vector<MissionEvent> events_;
 };
 

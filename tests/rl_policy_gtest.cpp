@@ -1278,3 +1278,69 @@ int main(int argc, char ** argv)
   rclcpp::shutdown();
   return result;
 }
+
+TEST_F(PluginTest, AGateOffsetMovesTheObservedGateWhileItIsFresh) {
+  build(flightParameters(rl_policy_test::fixturePath(kPolicyFixture)));
+  ASSERT_TRUE(plugin_->isReady());
+  const double dt = policyDt();
+  const auto offset_pub = helper_->create_publisher<geometry_msgs::msg::Vector3Stamped>(
+    std::string("/") + kNamespace + "/rl_policy/gate_offset", rclcpp::QoS(10));
+  setTime(100.0);
+  setTrajectoryMode(pose(14.5, 2.0, 0.2, 3.14));
+  ASSERT_TRUE(firstStep());
+  EXPECT_FALSE(plugin_->mission()->gateOffset().has_value());
+  const rl_policy::Gate gate = plugin_->mission()->sequencer().course().gate(0);
+
+  // 0.3 m left and 0.2 m down of gate 0's middle, as a 50 Hz detector would send it.
+  geometry_msgs::msg::Vector3Stamped offset;
+  offset.vector.y = 0.3;
+  offset.vector.z = -0.2;
+  for (int i = 0; i < 20; ++i) {
+    offset_pub->publish(offset);
+    spin(std::chrono::milliseconds(20));
+  }
+  setTime(100.0 + dt);
+  ASSERT_TRUE(computeOutput());
+  ASSERT_TRUE(plugin_->mission()->gateOffset().has_value());
+  EXPECT_EQ(plugin_->mission()->gateOffset()->gate, 0u);
+  EXPECT_EQ(plugin_->mission()->gateOffset()->offset, Eigen::Vector3d(0.0, 0.3, -0.2));
+
+  // Older than gate_offset.timeout_s: the gate is observed where it stands.
+  const double timeout = node_->get_parameter("rl_policy.gate_offset.timeout_s").as_double();
+  setTime(100.0 + 2.0 * dt + timeout);
+  ASSERT_TRUE(computeOutput());
+  EXPECT_FALSE(plugin_->mission()->gateOffset().has_value());
+
+  spin(std::chrono::milliseconds(300));
+  ASSERT_EQ(steps_.size(), 3u);
+  const auto frame = [](const std_msgs::msg::Float64MultiArray & step) {
+      return Eigen::Vector3d(step.data[4], step.data[5], step.data[6]);
+    };
+  const Eigen::Vector3d left(-std::sin(gate.yaw), std::cos(gate.yaw), 0.0);
+  EXPECT_TRUE(frame(steps_[0]).isApprox(gate.position));
+  EXPECT_TRUE(
+    frame(steps_[1]).isApprox(gate.position + 0.3 * left + Eigen::Vector3d(0.0, 0.0, -0.2)));
+  EXPECT_TRUE(frame(steps_[2]).isApprox(gate.position));
+  ASSERT_FALSE(statuses_.empty());
+  EXPECT_EQ(values(statuses_.back())["gate_offset_applied"], "false");
+}
+
+TEST_F(PluginTest, RefusesAGateOffsetThatDoesNotFitAndAnEmptyTopicTurnsItOff) {
+  const auto parameters = flightParameters(rl_policy_test::fixturePath(kPolicyFixture));
+  build(with(parameters, rclcpp::Parameter("rl_policy.gate_offset.gate", 12)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("is 12, the lap has 12 gates"), std::string::npos);
+  build(with(parameters, rclcpp::Parameter("rl_policy.gate_offset.gate", -1)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("is -1: a gate of the lap"), std::string::npos);
+  build(with(parameters, rclcpp::Parameter("rl_policy.gate_offset.timeout_s", 0.0)));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("gate_offset.timeout_s must be positive"), std::string::npos);
+
+  build(with(parameters, rclcpp::Parameter("rl_policy.gate_offset.topic", std::string())));
+  ASSERT_TRUE(plugin_->isReady());
+  setTime(1.0);
+  spin(std::chrono::milliseconds(300));
+  ASSERT_FALSE(statuses_.empty());
+  EXPECT_EQ(values(statuses_.back()).count("gate_offset_applied"), 0u);
+}

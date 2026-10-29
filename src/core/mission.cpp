@@ -491,6 +491,27 @@ ReferenceUpdate MissionController::updateHoldReference(double x, double y, doubl
   return holding ? ReferenceUpdate::Moved : ReferenceUpdate::Pending;
 }
 
+Course offsetCourse(const Course & course, const GateOffset & offset)
+{
+  std::vector<Gate> gates = course.gates();
+  Gate & gate = gates[offset.gate % gates.size()];
+  const double c = std::cos(gate.yaw);
+  const double s = std::sin(gate.yaw);
+  gate.position += Eigen::Vector3d(
+    c * offset.offset.x() - s * offset.offset.y(), s * offset.offset.x() + c * offset.offset.y(),
+    offset.offset.z());
+  return Course(std::move(gates), course.bounds());
+}
+
+bool MissionController::setGateOffset(std::size_t gate, const Eigen::Vector3d & offset)
+{
+  if (gate >= sequencer_.course().size() || !offset.allFinite()) {
+    return false;
+  }
+  gate_offset_ = GateOffset{gate, offset};
+  return true;
+}
+
 StepResult MissionController::step(const VehicleState & state, double t)
 {
   if (status_.phase == Phase::Idle) {
@@ -501,7 +522,11 @@ StepResult MissionController::step(const VehicleState & state, double t)
   }
 
   const bool racing = status_.phase == Phase::Race;
-  const Course & course = racing ? sequencer_.course() : hold_course_;
+  std::optional<Course> offset;
+  if (racing && gate_offset_) {
+    offset = offsetCourse(sequencer_.course(), *gate_offset_);
+  }
+  const Course & course = racing ? (offset ? *offset : sequencer_.course()) : hold_course_;
   const std::size_t target = racing ? sequencer_.target() : 0;
   const PolicySpec & spec = active_->spec();
 
