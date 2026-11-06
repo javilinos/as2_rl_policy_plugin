@@ -38,6 +38,11 @@ const std::vector<std::string> & optionalInitParameters()
     "race.virtual_valid_half_m",
     "race.stop_latency_s",
     "race.stop_decel_ms2",
+    "takeover.file",
+    "takeover.readings_topic",
+    "takeover.gates",
+    "takeover.kinds",
+    "takeover.left_right_one_at",
   };
   return tails;
 }
@@ -435,6 +440,34 @@ void Plugin::readSettings(Settings & settings)
       refuse(param("hold.reference") + ": " + e.what());
     }
   }
+  if (const auto * p = optionalSetting("takeover.file", ParameterType::PARAMETER_STRING)) {
+    settings.takeover_file = p->as_string();
+  }
+  if (!settings.takeover_file.empty()) {
+    const auto with_file = [this](const std::string & tail, rclcpp::ParameterType type) {
+        const auto * parameter = optionalSetting(tail, type);
+        if (!parameter && !getNodePtr()->has_parameter(param(tail))) {
+          refuse(param(tail) + " is required with " + param("takeover.file"));
+        }
+        return parameter;
+      };
+    if (const auto * p = with_file("takeover.readings_topic", ParameterType::PARAMETER_STRING)) {
+      settings.takeover_topic = p->as_string();
+    }
+    if (const auto * p = with_file("takeover.gates", ParameterType::PARAMETER_STRING_ARRAY)) {
+      settings.takeover_gates = p->as_string_array();
+    }
+    if (const auto * p = with_file("takeover.kinds", ParameterType::PARAMETER_STRING_ARRAY)) {
+      settings.takeover_kinds = p->as_string_array();
+    }
+    if (const auto * p = with_file("takeover.left_right_one_at", ParameterType::PARAMETER_STRING)) {
+      try {
+        settings.takeover_one_at = barSideFromString(p->as_string());
+      } catch (const std::invalid_argument & e) {
+        refuse(param("takeover.left_right_one_at") + ": " + e.what());
+      }
+    }
+  }
 }
 
 void Plugin::ownInitialize()
@@ -444,6 +477,8 @@ void Plugin::ownInitialize()
     "debug.status_topic", rclcpp::QoS(10));
   step_pub_ = createDebugPublisher<std_msgs::msg::Float64MultiArray>(
     "debug.step_topic", rclcpp::QoS(10));
+  takeover_pub_ = createDebugPublisher<std_msgs::msg::Float64MultiArray>(
+    "debug.takeover_topic", rclcpp::QoS(10));
 
   Settings settings;
   readSettings(settings);
@@ -521,9 +556,29 @@ void Plugin::ownInitialize()
       refuse(e.what());
     }
   }
+  std::shared_ptr<const TakeoverNetworks> networks;
+  std::vector<BarKind> bar_kinds;
+  if (!settings.takeover_file.empty()) {
+    try {
+      networks = TakeoverNetworks::load(settings.takeover_file);
+      bar_kinds = barKinds(networks->spec(), settings.takeover_gates, settings.takeover_kinds);
+      if (std::abs(networks->spec().dt - dt_) > kStepRateTolerance * dt_) {
+        refuse(
+          "the takeover steps at dt " + text(networks->spec().dt) + " s, the policies at " +
+          text(dt_) + " s");
+      }
+    } catch (const std::exception & e) {
+      networks.reset();
+      refuse(e.what());
+    }
+  }
   if (refusals_.empty() && bank) {
     try {
       mission_ = std::make_unique<MissionController>(settings.mission, std::move(*bank));
+      if (networks) {
+        mission_->setTakeover(
+          std::make_unique<Takeover>(networks, bar_kinds, settings.takeover_one_at));
+      }
     } catch (const std::exception & e) {
       refuse(e.what());
     }
@@ -549,6 +604,30 @@ void Plugin::ownInitialize()
       "rl_policy ready: %s mission, %zu gates, %d laps, step %.4f s, motor speeds from '%s'",
       toString(config.type), config.gates.size(), config.laps, dt_,
       motor_speed_sub_->get_topic_name());
+    if (const Takeover * takeover = mission_->takeover()) {
+      bar_reading_sub_ = getNodePtr()->create_subscription<vision_msgs::msg::Classification>(
+        settings.takeover_topic, rclcpp::SensorDataQoS(),
+        std::bind(&Plugin::barReadingCallback, this, std::placeholders::_1));
+      const TakeoverSpec & spec = takeover->networks().spec();
+      RCLCPP_INFO(
+        logger, "Takeover from %s: residual sha256 %s, aim sha256 %s",
+        absolutePath(spec.file).c_str(), spec.source.checkpoint_sha256.c_str(),
+        spec.aim_sha256.c_str());
+      RCLCPP_INFO(
+        logger, "Takeover reproduces its %zu golden rows: max error %.3g <= %.3g",
+        takeover->networks().goldenCheck().rows, takeover->networks().goldenCheck().max_error,
+        takeover->networks().goldenCheck().tolerance);
+      std::string bars;
+      for (std::size_t i = 0; i < spec.gates.size(); ++i) {
+        bars += (i == 0 ? "" : ", ") + spec.gates[i].name + " " + toString(takeover->kinds()[i]);
+      }
+      RCLCPP_INFO(
+        logger,
+        "Takeover around %s; the next obstacle's readings from '%s', thinned to %.1f Hz, the last "
+        "%d in the row; a left-right bar's position 1 is on the approach's %s (%s)", bars.c_str(),
+        bar_reading_sub_->get_topic_name(), spec.reading_hz, spec.history,
+        toString(takeover->oneAt()), param("takeover.left_right_one_at").c_str());
+    }
     if (config.type == MissionType::Race && config.course_source == CourseSource::RacePilot) {
       course_state_ = "waiting";
       RCLCPP_INFO(
@@ -978,6 +1057,7 @@ bool Plugin::computeOutput(
   last_step_time_ = now;
   writeCommand(result.command, now, twist, thrust);
   publishStep(result);
+  publishTakeover(result);
   return true;
 }
 
@@ -999,6 +1079,14 @@ void Plugin::motorSpeedCallback(const sensor_msgs::msg::JointState::SharedPtr ms
     RCLCPP_INFO(
       getNodePtr()->get_logger(), "Motor speeds received on '%s'",
       motor_speed_sub_->get_topic_name());
+  }
+}
+
+void Plugin::barReadingCallback(const vision_msgs::msg::Classification::SharedPtr msg)
+{
+  const double stamp = rclcpp::Time(msg->header.stamp).seconds();
+  for (const vision_msgs::msg::ObjectHypothesis & result : msg->results) {
+    mission_->addBarReading(result.class_id, result.score, stamp);
   }
 }
 
@@ -1085,6 +1173,40 @@ void Plugin::publishStep(const StepResult & result)
     data.push_back(result.command.rates(axis));
   }
   step_pub_->publish(msg);
+}
+
+void Plugin::publishTakeover(const StepResult & result)
+{
+  if (!takeover_pub_ || !result.takeover) {
+    return;
+  }
+  const TakeoverTick & tick = *result.takeover;
+  const Eigen::Index tail = kMainRowSize + kActionSize;
+  const Eigen::Index tail_columns = mission_->takeover()->networks().spec().width() - tail;
+  std_msgs::msg::Float64MultiArray msg;
+  msg.layout.dim.resize(1);
+  msg.layout.dim[0].label = kTakeoverLabel;
+  msg.layout.dim[0].size = kTakeoverHeadColumns + static_cast<std::size_t>(tail_columns);
+  msg.layout.dim[0].stride = msg.layout.dim[0].size;
+  msg.layout.data_offset = 0;
+
+  std::vector<double> & data = msg.data;
+  data.reserve(msg.layout.dim[0].size);
+  data.push_back(result.t);
+  data.push_back(static_cast<double>(static_cast<int>(tick.mode)));
+  data.push_back(static_cast<double>(tick.obstacle));
+  data.push_back(tick.gain);
+  data.push_back(tick.tau_s);
+  data.insert(data.end(), tick.main.begin(), tick.main.end());
+  data.push_back(tick.aim.x());
+  data.push_back(tick.aim.y());
+  data.insert(data.end(), tick.aimed.begin(), tick.aimed.end());
+  data.insert(data.end(), tick.residual.begin(), tick.residual.end());
+  for (Eigen::Index i = 0; i < tail_columns; ++i) {
+    data.push_back(
+      tick.row.size() > 0 ? tick.row(tail + i) : std::numeric_limits<double>::quiet_NaN());
+  }
+  takeover_pub_->publish(msg);
 }
 
 void Plugin::publishStatus()
@@ -1190,6 +1312,21 @@ diagnostic_msgs::msg::DiagnosticStatus Plugin::statusMessage() const
   msg.values.push_back(keyValue("motor_speed_age_s", text(motor_speed_age_s)));
   msg.values.push_back(keyValue("motor_speed_stale", text(motor_speed_stale_)));
   msg.values.push_back(keyValue("motor_speed_stale_steps", std::to_string(stale_steps_)));
+  if (const Takeover * takeover = mission_->takeover()) {
+    const double newest = takeover->readings().newest();
+    msg.values.push_back(keyValue("takeover_mode", toString(takeover->mode())));
+    msg.values.push_back(
+      keyValue("takeover_gate", takeover->networks().spec().gates[takeover->obstacle()].name));
+    msg.values.push_back(keyValue("takeover_gain", text(takeover->gain())));
+    msg.values.push_back(
+      keyValue("takeover_readings_seen", std::to_string(takeover->readingsSeen())));
+    msg.values.push_back(
+      keyValue("takeover_readings_kept", std::to_string(takeover->readingsKept())));
+    msg.values.push_back(
+      keyValue(
+        "takeover_reading_age_s",
+        text(std::isfinite(newest) ? getNodePtr()->now().seconds() - newest : nan)));
+  }
   msg.values.push_back(keyValue("last_event", last_event_));
   return msg;
 }

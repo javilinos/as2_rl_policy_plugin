@@ -1,0 +1,12 @@
+# Written by quadlab.cli.gen_takeover_fixtures: a detector's position and the row's two
+# values. horizontal_left: its 1 on the approach's left; horizontal_right: on its right.
+readings:
+  - {position: 0.0, vertical: [-1.0, 0.0], horizontal_left: [1.0, 0.0], horizontal_right: [-1.0, 0.0], rotating: [0.0, 1.0]}
+  - {position: 0.125, vertical: [-0.75, 0.0], horizontal_left: [0.75, 0.0], horizontal_right: [-0.75, 0.0], rotating: [0.7040147244559684, 0.7101853756232854]}
+  - {position: 0.25, vertical: [-0.5, 0.0], horizontal_left: [0.5, 0.0], horizontal_right: [-0.5, 0.0], rotating: [0.9999619230641713, 0.008726535498373897]}
+  - {position: 0.375, vertical: [-0.25, 0.0], horizontal_left: [0.25, 0.0], horizontal_right: [-0.25, 0.0], rotating: [0.7163019434246544, -0.69779045984168]}
+  - {position: 0.5, vertical: [0.0, 0.0], horizontal_left: [-0.0, 0.0], horizontal_right: [0.0, 0.0], rotating: [0.01745240643728344, -0.9998476951563913]}
+  - {position: 0.625, vertical: [0.25, 0.0], horizontal_left: [-0.25, 0.0], horizontal_right: [0.25, 0.0], rotating: [-0.6915130557822696, -0.7223639620597554]}
+  - {position: 0.75, vertical: [0.5, 0.0], horizontal_left: [-0.5, 0.0], horizontal_right: [0.5, 0.0], rotating: [-0.9996573249755573, -0.026176948307873482]}
+  - {position: 0.875, vertical: [0.75, 0.0], horizontal_left: [-0.75, 0.0], horizontal_right: [0.75, 0.0], rotating: [-0.7283709698824004, 0.6851829903263591]}
+  - {position: 1.0, vertical: [1.0, 0.0], horizontal_left: [-1.0, 0.0], horizontal_right: [1.0, 0.0], rotating: [-0.034899496702500823, 0.9993908270190958]}

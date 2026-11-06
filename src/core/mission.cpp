@@ -431,6 +431,9 @@ bool MissionController::start()
   status_.holding = false;
   status_.predicted_stop.reset();
   activate(kRacePolicy);
+  if (takeover_) {
+    takeover_->start(sequencer_.target(), sequencer_.course().size());
+  }
 
   MissionEvent event;
   event.type = MissionEvent::Type::PhaseChange;
@@ -440,6 +443,44 @@ bool MissionController::start()
   event.gate = sequencer_.target();
   events_.push_back(event);
   return true;
+}
+
+void MissionController::setTakeover(std::unique_ptr<Takeover> takeover)
+{
+  require(config_.type == MissionType::Race, "the takeover flies a race mission");
+  const TakeoverSpec & spec = takeover->networks().spec();
+  const PolicySpec & race = policies_.get(kRacePolicy)->spec();
+  require(
+    race.observation.dim == kMainRowSize,
+    format(
+      "the takeover's networks read a race policy of %d observations, this one has %d",
+      kMainRowSize, race.observation.dim));
+  require(
+    race.source.checkpoint_sha256 == spec.main_sha256,
+    "the takeover's networks trained around checkpoint " + spec.main_sha256 +
+    ", the race policy is " + race.source.checkpoint_sha256);
+  require(
+    std::abs(race.dt - spec.dt) < 1.0e-9,
+    format("the takeover steps at dt %g s, the race policy at %g s", spec.dt, race.dt));
+  require(
+    race.course.has_value(), "the race policy carries no course to find the barred gates in");
+  require(
+    race.course->gates.size() == config_.gates.size(),
+    format(
+      "the race policy trained on %zu gates, the course has %zu", race.course->gates.size(),
+      config_.gates.size()));
+  for (const TakeoverGate & gate : spec.gates) {
+    require(
+      gate.index < race.course->names.size() && race.course->names[gate.index] == gate.name,
+      "the takeover's '" + gate.name + "' is not that gate of the race policy's course");
+  }
+  takeover_ = std::move(takeover);
+}
+
+bool MissionController::addBarReading(const std::string & gate, double position, double stamp)
+{
+  return takeover_ && status_.phase == Phase::Race &&
+         takeover_->addReading(gate, position, stamp);
 }
 
 bool MissionController::requestHold(double x, double y, double z, double yaw)
@@ -510,7 +551,13 @@ StepResult MissionController::step(const VehicleState & state, double t)
   result.frame = course.gate(target);
   result.observation = buildObservation(
     state, course, target, history_, spec.observation.motor_speed_normalization, attitude_);
-  result.action = clip(active_->act(result.observation));
+  if (racing && takeover_) {
+    takeover_->advance(state, course, target);
+    result.action = clip(takeover_->act(*active_, result.observation, state, course, t));
+    result.takeover = takeover_->tick();
+  } else {
+    result.action = clip(active_->act(result.observation));
+  }
   history_.push(result.action);
   result.command = decode(result.action, spec.action, config_.mass_kg);
 

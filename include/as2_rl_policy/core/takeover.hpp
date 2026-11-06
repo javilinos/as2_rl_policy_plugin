@@ -1,0 +1,277 @@
+#ifndef AS2_RL_POLICY__CORE__TAKEOVER_HPP_
+#define AS2_RL_POLICY__CORE__TAKEOVER_HPP_
+
+// Two networks around the moving bars, on top of the race policy they trained with (main), which
+// keeps flying the lap (quadlab.envs.takeover). In a window around a barred gate, with g its gain:
+//
+//   row = main's row + main's action + the readings + the bar's type + time to the gate + g
+//   before the plane: main's row[1:2] -= aim_m * g * aim(row), and main's action is main's on that
+//   row[31:34] = main's action
+//   action = clip(main's action + authority * g * residual(row), -1, 1)
+//
+// The readings are the detector's, of the next obstacle only, and the networks see nothing else of
+// the bar: not its speed, not where it will be.
+
+#include <Eigen/Dense>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "as2_rl_policy/core/angles.hpp"
+#include "as2_rl_policy/core/course.hpp"
+#include "as2_rl_policy/core/observation.hpp"
+#include "as2_rl_policy/core/policy.hpp"
+
+namespace rl_policy
+{
+
+inline constexpr const char kTakeoverFormat[] = "quadlab_takeover";
+inline constexpr int kTakeoverFormatVersion = 1;
+// main's row: the R6 block and two commands.
+inline constexpr int kMainRowSize = 31;
+inline constexpr int kAimSize = 2;
+// Two values and the age.
+inline constexpr int kReadingColumns = 3;
+inline constexpr int kBarKinds = 3;
+// A rotating bar at a detector's position of 1, detect_gates' barPlacement.
+inline constexpr double kBarTurnRad = 179.0 * kPi / 180.0;
+
+// The order of the row's bar type columns.
+enum class BarKind
+{
+  UpDown = 0,
+  LeftRight = 1,
+  Rotating = 2,
+};
+
+// The side of the approach a detector's position of 1 puts a left-right bar on. The networks
+// trained on the right; obstacle_gates reports the gate's left.
+enum class BarSide
+{
+  Left,
+  Right,
+};
+
+// quadlab.envs.takeover.TakeoverVecEnv's four modes.
+enum class TakeoverMode
+{
+  Before = 0,
+  Active = 1,
+  HandingBack = 2,
+  Tail = 3,
+};
+
+const char * toString(BarKind kind);
+
+const char * toString(BarSide side);
+
+const char * toString(TakeoverMode mode);
+
+// The word of a mission's obstacles: throws std::invalid_argument for anything but "vertical",
+// "horizontal" or "rotating".
+BarKind barKindFromString(const std::string & name);
+
+// Throws std::invalid_argument for anything but "left" or "right".
+BarSide barSideFromString(const std::string & name);
+
+// The row's two values of a detector's position (0 to 1): a sliding bar's place over its travel,
+// up and to the approach's right, then zero; a rotating bar's sine and cosine of twice its angle,
+// from the gate's left towards its up.
+std::array<double, 2> barValues(BarKind kind, double position, BarSide one_at);
+
+struct TakeoverGate
+{
+  std::string name;
+  // In the course.
+  std::size_t index = 0;
+  // Positive: the window opens this long before the plane, while the gate before is the target.
+  double open_s = 0.0;
+  // The bars the networks trained on here.
+  std::vector<BarKind> kinds;
+};
+
+// What a takeover file says defines its networks.
+struct TakeoverSpec
+{
+  std::string file;
+  double dt = 0.0;
+  std::string main_checkpoint;
+  std::string main_sha256;
+  double aim_m = 0.0;
+  double authority = 0.0;
+  double ramp_in_s = 0.0;
+  double ramp_out_s = 0.0;
+  double handback_m = 0.0;
+  int history = 0;
+  double reading_hz = 0.0;
+  double max_age_s = 0.0;
+  double time_scale_s = 0.0;
+  std::vector<TakeoverGate> gates;
+  PolicySource source;
+  std::string aim_checkpoint;
+  std::string aim_sha256;
+
+  // The row's entries.
+  int width() const {return kMainRowSize + kActionSize + readingEntries() + kBarKinds + 2;}
+
+  int readingEntries() const {return kReadingColumns * history;}
+};
+
+class TakeoverNetworks
+{
+public:
+  TakeoverNetworks(
+    TakeoverSpec spec, std::vector<MlpPolicy::Layer> aim, std::vector<MlpPolicy::Layer> residual);
+
+  // Parses a quadlab_takeover file and refuses it unless its goldens reproduce.
+  static std::shared_ptr<const TakeoverNetworks> load(const std::string & path);
+
+  const TakeoverSpec & spec() const {return spec_;}
+
+  // Both clipped to [-1, 1].
+  Eigen::Vector2d aim(const Eigen::VectorXd & row) const;
+
+  Action residual(const Eigen::VectorXd & row) const;
+
+  const MlpPolicy::GoldenCheck & goldenCheck() const {return golden_check_;}
+
+private:
+  TakeoverSpec spec_;
+  std::vector<MlpPolicy::Layer> aim_;
+  std::vector<MlpPolicy::Layer> residual_;
+  MlpPolicy::GoldenCheck golden_check_;
+};
+
+// The bar kinds of the file's gates, in its order, from the gates a flight names and what stands
+// in each. Throws std::invalid_argument unless they are the file's gates, each with a bar it
+// trained on.
+std::vector<BarKind> barKinds(
+  const TakeoverSpec & spec, const std::vector<std::string> & gates,
+  const std::vector<std::string> & kinds);
+
+// The last readings of one obstacle, newest first. A detector faster than the rate the networks
+// trained on is thinned to it: at its own rate, the history would span a fraction of the time
+// they read the bar's motion over.
+class BarReadings
+{
+public:
+  BarReadings(int history, double hz, double max_age_s);
+
+  void clear();
+
+  // A reading stamped with its frame's time; false when late, repeated or thinned out.
+  bool add(double stamp, const std::array<double, 2> & values);
+
+  // A reading kept whatever its time, past the thinning.
+  void keep(double stamp, const std::array<double, 2> & values);
+
+  // Newest first, (value, value, age over max_age_s): zeros and 1 for a reading gone or missing.
+  void write(double now, Eigen::Ref<Eigen::VectorXd> out) const;
+
+  // The time of the newest reading; -infinity with none.
+  double newest() const {return stamps_.front();}
+
+private:
+  double period_s_;
+  double max_age_s_;
+  double next_due_ = -std::numeric_limits<double>::infinity();
+  std::vector<double> stamps_;
+  std::vector<std::array<double, 2>> values_;
+};
+
+// What one tick did, for the debug topic.
+struct TakeoverTick
+{
+  TakeoverMode mode = TakeoverMode::Before;
+  std::size_t obstacle = 0;
+  double gain = 0.0;
+  double tau_s = 0.0;
+  Action main{};
+  Eigen::Vector2d aim = Eigen::Vector2d::Zero();
+  Action aimed{};
+  Action residual{};
+  // The row the residual read; empty outside the window.
+  Eigen::VectorXd row;
+};
+
+class Takeover
+{
+public:
+  // kinds: what stands at each of the file's gates, barKinds().
+  Takeover(
+    std::shared_ptr<const TakeoverNetworks> networks, std::vector<BarKind> kinds, BarSide one_at);
+
+  // The race starts on a course of so many gates: the next obstacle from the target, nothing read
+  // of it.
+  void start(std::size_t target, std::size_t gates);
+
+  // One detector result, kept when it is of the next obstacle. Any time, the frame's stamp.
+  bool addReading(const std::string & gate, double position, double stamp);
+
+  // A reading in the row's values, past the thinning and the gate.
+  void keepValues(double stamp, const std::array<double, 2> & values);
+
+  // This tick's window, on the estimate and the target.
+  void advance(const VehicleState & state, const Course & course, std::size_t target);
+
+  // This tick's action, after advance(). Outside the window, exactly one act() of main.
+  Action act(
+    const Policy & main, const Eigen::VectorXd & row, const VehicleState & state,
+    const Course & course, double t);
+
+  const TakeoverNetworks & networks() const {return *networks_;}
+
+  const std::vector<BarKind> & kinds() const {return kinds_;}
+
+  BarSide oneAt() const {return one_at_;}
+
+  TakeoverMode mode() const {return mode_;}
+
+  // The next obstacle, an index of the file's gates.
+  std::size_t obstacle() const {return obstacle_;}
+
+  double gain() const {return gain_;}
+
+  const TakeoverTick & tick() const {return tick_;}
+
+  const BarReadings & readings() const {return readings_;}
+
+  // Detector results taken in, of any gate, and how many of them the row has held.
+  std::uint64_t readingsSeen() const {return seen_;}
+
+  std::uint64_t readingsKept() const {return kept_;}
+
+private:
+  // The first barred gate at or after the target, round the course.
+  std::size_t nextObstacle(std::size_t target, std::size_t gates) const;
+
+  void open();
+
+  // How far past the obstacle's plane, along its normal.
+  double beyond(const VehicleState & state, const Course & course) const;
+
+  // To the obstacle's plane at the speed along its normal, 1 m/s at least, in [0, time_scale_s].
+  double tau(const VehicleState & state, const Course & course) const;
+
+  std::shared_ptr<const TakeoverNetworks> networks_;
+  std::vector<BarKind> kinds_;
+  BarSide one_at_;
+  BarReadings readings_;
+  TakeoverMode mode_ = TakeoverMode::Before;
+  std::size_t obstacle_ = 0;
+  double clock_s_ = 0.0;
+  double gain_ = 0.0;
+  double gain_out_ = 0.0;
+  TakeoverTick tick_;
+  std::uint64_t seen_ = 0;
+  std::uint64_t kept_ = 0;
+};
+
+}  // namespace rl_policy
+
+#endif  // AS2_RL_POLICY__CORE__TAKEOVER_HPP_

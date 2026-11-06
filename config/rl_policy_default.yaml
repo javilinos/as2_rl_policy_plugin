@@ -40,6 +40,13 @@
         reference: sent_or_configured # sent_or_configured: the hover mission holds the last point of a sent trajectory reference, else setpoint | configured: setpoint
         min_altitude_m: 1.0
         after_race: here # here | setpoint | end_point: where the race's finish holds (end_point: race_pilot's end point at setpoint's yaw, setpoint without one)
+      takeover: # the two networks around the moving bars, on top of the race policy they trained with
+        file: "" # quadlab's export_takeover; empty: no takeover. With a file, also:
+        # gates: [gate07, gate12_oct] # the file's barred gates, the names the detector's class_id gives
+        # kinds: [vertical, rotating] # what stands in each, the mission's obstacles' type: vertical | horizontal | rotating
+        # left_right_one_at: left # left | right: the side of the approach a horizontal bar's position 1 is on; obstacle_gates says left
+        readings_topic: obstacle_positions # vision_msgs/Classification: class_id the gate, score the bar's position (0 to 1), header.stamp the frame's
       debug:
         status_topic: rl_policy/status # "" disables
         step_topic: rl_policy/step # "" disables
+        takeover_topic: rl_policy/takeover # "" disables

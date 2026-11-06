@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -17,6 +18,7 @@
 #include <rosgraph_msgs/msg/clock.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <vision_msgs/msg/classification.hpp>
 
 #include "as2_core/node.hpp"
 #include "as2_msgs/msg/control_mode.hpp"
@@ -80,6 +82,52 @@ std::vector<rclcpp::Parameter> hoverParameters()
   return with(
     parameters,
     rclcpp::Parameter("rl_policy.policies.files", std::vector<std::string>{policy}));
+}
+
+// The circuit the takeover's networks trained on, their race policy, and the networks.
+std::vector<rclcpp::Parameter> takeoverParameters()
+{
+  const std::string main = rl_policy_test::fixturePath("takeover_main.yaml");
+  const YAML::Node course = rl_policy_test::loadFixture("takeover_trace.yaml")["course"];
+  std::vector<int64_t> shapes;
+  std::vector<bool> virtuals;
+  const YAML::Node policy = rl_policy_test::loadFixture("takeover_main.yaml");
+  for (const YAML::Node & gate : policy["course"]["gates"]) {
+    shapes.push_back(gate["shape"].as<std::string>() == "octagon" ? 1 : 0);
+    virtuals.push_back(gate["virtual"].as<bool>());
+  }
+  return {
+    rclcpp::Parameter("use_sim_time", true),
+    rclcpp::Parameter("cmd_freq", 100.0),
+    rclcpp::Parameter("rl_policy.policies.files", std::vector<std::string>{main, main}),
+    rclcpp::Parameter("rl_policy.course.gates_x", rl_policy_test::doubles(course["gates_x"])),
+    rclcpp::Parameter("rl_policy.course.gates_y", rl_policy_test::doubles(course["gates_y"])),
+    rclcpp::Parameter("rl_policy.course.gates_z", rl_policy_test::doubles(course["gates_z"])),
+    rclcpp::Parameter("rl_policy.course.gates_yaw", rl_policy_test::doubles(course["gates_yaw"])),
+    rclcpp::Parameter("rl_policy.course.gates_shape", shapes),
+    rclcpp::Parameter("rl_policy.course.gates_virtual", virtuals),
+    rclcpp::Parameter("rl_policy.course.bounds_x", std::vector<double>{0.0, 27.0}),
+    rclcpp::Parameter("rl_policy.course.bounds_y", std::vector<double>{0.0, 38.0}),
+    rclcpp::Parameter(
+      "rl_policy.takeover.file", rl_policy_test::fixturePath("takeover.yaml")),
+    rclcpp::Parameter(
+      "rl_policy.takeover.gates", std::vector<std::string>{"gate07", "gate12_oct"}),
+    rclcpp::Parameter(
+      "rl_policy.takeover.kinds", std::vector<std::string>{"vertical", "rotating"}),
+    rclcpp::Parameter("rl_policy.takeover.left_right_one_at", std::string("left")),
+  };
+}
+
+std::vector<rclcpp::Parameter> without(
+  std::vector<rclcpp::Parameter> parameters, const std::string & name)
+{
+  std::vector<rclcpp::Parameter> kept;
+  for (const rclcpp::Parameter & parameter : parameters) {
+    if (parameter.get_name() != name) {
+      kept.push_back(parameter);
+    }
+  }
+  return kept;
 }
 
 // A course as as2_race_pilot sends it: [x, y, z, yaw] per point, the end point last.
@@ -205,6 +253,12 @@ protected:
     step_sub_ = helper_->create_subscription<std_msgs::msg::Float64MultiArray>(
       std::string("/") + kNamespace + "/debug/controller/rl_policy/step", rclcpp::QoS(10),
       [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {steps_.push_back(*msg);});
+    takeover_sub_ = helper_->create_subscription<std_msgs::msg::Float64MultiArray>(
+      std::string("/") + kNamespace + "/debug/controller/rl_policy/takeover", rclcpp::QoS(10),
+      [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {takeovers_.push_back(*msg);});
+    // As obstacle_gates publishes them.
+    reading_pub_ = helper_->create_publisher<vision_msgs::msg::Classification>(
+      "obstacle_positions", rclcpp::QoS(10).reliable());
   }
 
   void TearDown() override
@@ -263,6 +317,22 @@ protected:
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     FAIL() << "the node clock never reached " << seconds;
+  }
+
+  // One frame of the detector's: (gate, position) per bar, stamped with the frame's time.
+  void publishReading(
+    double stamp, const std::vector<std::pair<std::string, double>> & bars)
+  {
+    vision_msgs::msg::Classification msg;
+    msg.header.stamp = rclcpp::Time(static_cast<int64_t>(std::llround(stamp * 1e9)), RCL_ROS_TIME);
+    msg.header.frame_id = "earth";
+    for (const auto & [gate, position] : bars) {
+      vision_msgs::msg::ObjectHypothesis result;
+      result.class_id = gate;
+      result.score = position;
+      msg.results.push_back(result);
+    }
+    reading_pub_->publish(msg);
   }
 
   void publishMotorSpeeds(double speed)
@@ -324,8 +394,11 @@ protected:
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr motor_pub_;
   rclcpp::Subscription<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr status_sub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr step_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr takeover_sub_;
+  rclcpp::Publisher<vision_msgs::msg::Classification>::SharedPtr reading_pub_;
   std::vector<diagnostic_msgs::msg::DiagnosticStatus> statuses_;
   std::vector<std_msgs::msg::Float64MultiArray> steps_;
+  std::vector<std_msgs::msg::Float64MultiArray> takeovers_;
 
   std::shared_ptr<as2::Node> node_;
   std::shared_ptr<rl_policy::Plugin> plugin_;
@@ -1268,6 +1341,120 @@ TEST_F(PluginTest, AfterRaceEndPointTakesTheRacePilotsEndPoint) {
   build(parameters);
   EXPECT_FALSE(plugin_->isReady());
   EXPECT_NE(statusMessage().find("course.source race_pilot"), std::string::npos);
+}
+
+TEST_F(PluginTest, WithoutATakeoverFileThereIsNoTakeover) {
+  build(flightParameters(rl_policy_test::fixturePath(kPolicyFixture)));
+  ASSERT_TRUE(plugin_->isReady());
+  EXPECT_EQ(plugin_->mission()->takeover(), nullptr);
+  setTime(100.0);
+  setTrajectoryMode(pose(14.5, 2.0, 0.2, 3.14));
+  ASSERT_TRUE(firstStep());
+  statuses_.clear();
+  spin(std::chrono::milliseconds(300));
+  ASSERT_FALSE(statuses_.empty());
+  EXPECT_EQ(values(statuses_.back()).count("takeover_mode"), 0u);
+  EXPECT_TRUE(takeovers_.empty());
+}
+
+TEST_F(PluginTest, ATakeoverFlightSaysHowItIsSet) {
+  build(takeoverParameters());
+  ASSERT_TRUE(plugin_->isReady()) << statusMessage();
+  const rl_policy::Takeover * takeover = plugin_->mission()->takeover();
+  ASSERT_NE(takeover, nullptr);
+  EXPECT_EQ(takeover->oneAt(), rl_policy::BarSide::Left);
+  EXPECT_EQ(
+    takeover->kinds(),
+    (std::vector<rl_policy::BarKind>{rl_policy::BarKind::UpDown, rl_policy::BarKind::Rotating}));
+}
+
+TEST_F(PluginTest, RefusesATakeoverThatDoesNotFit) {
+  const auto parameters = takeoverParameters();
+  for (const char * tail : {"gates", "kinds", "left_right_one_at"}) {
+    const std::string name = std::string("rl_policy.takeover.") + tail;
+    build(without(parameters, name));
+    EXPECT_FALSE(plugin_->isReady()) << name;
+    EXPECT_NE(statusMessage().find(name), std::string::npos) << name;
+  }
+
+  build(with(parameters, rclcpp::Parameter("rl_policy.takeover.file", std::string("/no/file"))));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("cannot open takeover file"), std::string::npos);
+
+  build(
+    with(
+      parameters, rclcpp::Parameter(
+        "rl_policy.takeover.kinds", std::vector<std::string>{"rotating", "rotating"})));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("did not train on a rotating bar"), std::string::npos);
+
+  build(
+    with(
+      parameters,
+      rclcpp::Parameter("rl_policy.takeover.left_right_one_at", std::string("up"))));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("neither left nor right"), std::string::npos);
+
+  const std::string other = rl_policy_test::fixturePath(kR6PolicyFixture);
+  build(
+    with(
+      parameters, rclcpp::Parameter(
+        "rl_policy.policies.files", std::vector<std::string>{other, other})));
+  EXPECT_FALSE(plugin_->isReady());
+  EXPECT_NE(statusMessage().find("trained around checkpoint"), std::string::npos);
+}
+
+TEST_F(PluginTest, TheDetectorsFramesReachTheTakeover) {
+  build(takeoverParameters());
+  ASSERT_TRUE(plugin_->isReady()) << statusMessage();
+  setTime(100.0);
+  setTrajectoryMode(pose(23.09, 4.24, 1.0, -3.1261));
+  ASSERT_TRUE(firstStep());
+  const rl_policy::Takeover * takeover = plugin_->mission()->takeover();
+  ASSERT_NE(takeover, nullptr);
+
+  // Both bars in a frame: only the next obstacle's is kept.
+  publishReading(99.97, {{"gate12_oct", 0.5}, {"gate07", 0.75}});
+  spin(std::chrono::milliseconds(100));
+  EXPECT_EQ(takeover->readingsSeen(), 2u);
+  EXPECT_EQ(takeover->readingsKept(), 1u);
+  EXPECT_DOUBLE_EQ(takeover->readings().newest(), 99.97);
+
+  // An 80 Hz detector's next frame is thinned out.
+  publishReading(99.9825, {{"gate07", 0.75}});
+  spin(std::chrono::milliseconds(100));
+  EXPECT_EQ(takeover->readingsSeen(), 3u);
+  EXPECT_EQ(takeover->readingsKept(), 1u);
+
+  setTime(100.01);
+  ASSERT_TRUE(computeOutput());
+  spin(std::chrono::milliseconds(100));
+  statuses_.clear();
+  setTime(100.5);
+  spin(std::chrono::milliseconds(300));
+  ASSERT_FALSE(statuses_.empty());
+  auto status = values(statuses_.back());
+  EXPECT_EQ(status["takeover_mode"], "before");
+  EXPECT_EQ(status["takeover_gate"], "gate07");
+  EXPECT_EQ(status["takeover_readings_seen"], "3");
+  EXPECT_EQ(status["takeover_readings_kept"], "1");
+  EXPECT_NEAR(std::stod(status["takeover_reading_age_s"]), 0.53, 1e-6);
+
+  ASSERT_GE(takeovers_.size(), 2u);
+  const std_msgs::msg::Float64MultiArray & tick = takeovers_.back();
+  ASSERT_EQ(tick.layout.dim.size(), 1u);
+  EXPECT_EQ(tick.layout.dim[0].label, rl_policy::kTakeoverLabel);
+  ASSERT_EQ(tick.data.size(), 54u);
+  EXPECT_NEAR(tick.data[0], 100.01, 1e-6);
+  EXPECT_EQ(tick.data[1], 0.0);
+  EXPECT_EQ(tick.data[2], 0.0);
+  EXPECT_EQ(tick.data[3], 0.0);
+  for (std::size_t i = 0; i < 19; ++i) {
+    EXPECT_TRUE(std::isfinite(tick.data[i])) << "column " << i;
+  }
+  for (std::size_t i = 19; i < 54; ++i) {
+    EXPECT_TRUE(std::isnan(tick.data[i])) << "column " << i;
+  }
 }
 
 int main(int argc, char ** argv)

@@ -13,6 +13,7 @@ set(CORE_TESTS
   gates
   mission
   race_pilot_course
+  takeover
 )
 
 foreach(TEST_NAME ${CORE_TESTS})

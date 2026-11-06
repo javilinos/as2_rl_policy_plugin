@@ -17,6 +17,7 @@
 #include "as2_rl_policy/core/observation.hpp"
 #include "as2_rl_policy/core/policy.hpp"
 #include "as2_rl_policy/core/race_pilot_course.hpp"
+#include "as2_rl_policy/core/takeover.hpp"
 
 namespace rl_policy
 {
@@ -235,6 +236,8 @@ struct StepResult
   // The target frame the observation is relative to: the gate, or the hold setpoint.
   Gate frame;
   MissionStatus status;
+  // What the takeover did, on a race step with one.
+  std::optional<TakeoverTick> takeover;
 };
 
 class MissionController
@@ -259,7 +262,14 @@ public:
   // The race can start: a configured course, or a sent one that matched.
   bool courseReady() const;
 
-  // One policy step, exactly one act() of the active policy.
+  // Flies the takeover around the bars. Throws std::invalid_argument unless this is a race mission
+  // whose race policy is the one the networks trained with, on the circuit they trained on.
+  void setTakeover(std::unique_ptr<Takeover> takeover);
+
+  // A detector result for the race's takeover: true when the row will hold it.
+  bool addBarReading(const std::string & gate, double position, double stamp);
+
+  // One policy step: exactly one act() of the active policy, unless the takeover's window is open.
   StepResult step(const VehicleState & state, double t);
 
   // (x, y) into the bounds, z no lower than the minimum altitude, yaw unchanged.
@@ -289,6 +299,9 @@ public:
 
   // What the last takeSentCourse() found.
   const std::optional<CourseMatch> & lastMatch() const {return last_match_;}
+
+  // Null without one.
+  const Takeover * takeover() const {return takeover_.get();}
 
 private:
   static MissionConfig validated(MissionConfig config, const PolicyBank & policies);
@@ -321,6 +334,7 @@ private:
   std::optional<Gate> sent_reference_;
   std::optional<SentCourse> sent_course_;
   std::optional<CourseMatch> last_match_;
+  std::unique_ptr<Takeover> takeover_;
   std::vector<MissionEvent> events_;
 };
 

@@ -4,8 +4,9 @@
 
 #include <algorithm>
 #include <cmath>
-#include <sstream>
 #include <utility>
+
+#include "yaml_fields.hpp"
 
 namespace rl_policy
 {
@@ -15,100 +16,6 @@ namespace
 
 // Two policies share a step when their dt agree to a nanosecond.
 constexpr double kDtTolerance = 1.0e-9;
-
-std::string number(double value)
-{
-  std::ostringstream stream;
-  stream.precision(9);
-  stream << value;
-  return stream.str();
-}
-
-std::string join(const std::string & path, const std::string & key)
-{
-  return path.empty() ? key : path + "." + key;
-}
-
-YAML::Node required(const YAML::Node & parent, const std::string & key, const std::string & path)
-{
-  if (!parent.IsMap()) {
-    throw PolicyError("'" + (path.empty() ? std::string("the file") : path) + "' is not a mapping");
-  }
-  const YAML::Node value = parent[key];
-  if (!value.IsDefined() || value.IsNull()) {
-    throw PolicyError("missing '" + join(path, key) + "'");
-  }
-  return value;
-}
-
-template<typename T>
-T scalar(const YAML::Node & node, const std::string & path, const char * type)
-{
-  if (!node.IsScalar()) {
-    throw PolicyError("'" + path + "' is not a " + type);
-  }
-  try {
-    return node.as<T>();
-  } catch (const YAML::Exception &) {
-    throw PolicyError("'" + path + "' is not a " + type + ": '" + node.Scalar() + "'");
-  }
-}
-
-double finiteDouble(const YAML::Node & node, const std::string & path)
-{
-  const double value = scalar<double>(node, path, "number");
-  if (!std::isfinite(value)) {
-    throw PolicyError("'" + path + "' is not finite");
-  }
-  return value;
-}
-
-double positiveDouble(const YAML::Node & node, const std::string & path)
-{
-  const double value = finiteDouble(node, path);
-  if (!(value > 0.0)) {
-    throw PolicyError("'" + path + "' must be positive, got " + number(value));
-  }
-  return value;
-}
-
-std::vector<double> doubles(const YAML::Node & node, const std::string & path)
-{
-  if (!node.IsSequence()) {
-    throw PolicyError("'" + path + "' is not a sequence");
-  }
-  std::vector<double> values;
-  values.reserve(node.size());
-  for (std::size_t i = 0; i < node.size(); ++i) {
-    values.push_back(finiteDouble(node[i], path + "[" + std::to_string(i) + "]"));
-  }
-  return values;
-}
-
-std::string optionalString(
-  const YAML::Node & parent, const std::string & key, const std::string & fallback)
-{
-  if (!parent.IsMap()) {
-    return fallback;
-  }
-  const YAML::Node value = parent[key];
-  if (!value.IsDefined() || value.IsNull() || !value.IsScalar()) {
-    return fallback;
-  }
-  return value.Scalar();
-}
-
-void expectString(
-  const YAML::Node & parent, const std::string & key, const std::string & path,
-  const std::string & expected)
-{
-  const std::string value =
-    scalar<std::string>(required(parent, key, path), join(path, key), "string");
-  if (value != expected) {
-    throw PolicyError(
-            "'" + join(path, key) + "' is '" + value + "', only '" + expected + "' is supported");
-  }
-}
 
 // The optional course block: one lap of crossings, each {name, position, yaw, virtual, shape}.
 std::optional<TrainedCourse> parseCourse(const YAML::Node & node)
@@ -157,69 +64,6 @@ std::optional<TrainedCourse> parseCourse(const YAML::Node & node)
     course.gates.push_back(gate);
   }
   return course;
-}
-
-// Weights are float32 values; parsing them as float keeps exactly the network that was trained.
-double float32(double value)
-{
-  return static_cast<double>(static_cast<float>(value));
-}
-
-MlpPolicy::Layer parseLayer(const YAML::Node & node, const std::string & path)
-{
-  const YAML::Node shape_node = required(node, "shape", path);
-  if (!shape_node.IsSequence() || shape_node.size() != 2) {
-    throw PolicyError("'" + path + ".shape' must be [out, in]");
-  }
-  const int rows = scalar<int>(shape_node[0], path + ".shape[0]", "integer");
-  const int cols = scalar<int>(shape_node[1], path + ".shape[1]", "integer");
-  if (rows <= 0 || cols <= 0) {
-    throw PolicyError("'" + path + ".shape' must be positive");
-  }
-  const std::vector<double> weight = doubles(required(node, "weight", path), path + ".weight");
-  const std::vector<double> bias = doubles(required(node, "bias", path), path + ".bias");
-  if (weight.size() != static_cast<std::size_t>(rows) * static_cast<std::size_t>(cols)) {
-    throw PolicyError(
-            "'" + path + ".weight' has " + std::to_string(weight.size()) + " values, shape [" +
-            std::to_string(rows) + ", " + std::to_string(cols) + "] needs " +
-            std::to_string(rows * cols));
-  }
-  if (bias.size() != static_cast<std::size_t>(rows)) {
-    throw PolicyError(
-            "'" + path + ".bias' has " + std::to_string(bias.size()) + " values, shape needs " +
-            std::to_string(rows));
-  }
-  MlpPolicy::Layer layer;
-  layer.weight.resize(rows, cols);
-  layer.bias.resize(rows);
-  for (int r = 0; r < rows; ++r) {
-    for (int c = 0; c < cols; ++c) {
-      layer.weight(r, c) = float32(weight[static_cast<std::size_t>(r) * cols + c]);
-    }
-    layer.bias(r) = float32(bias[r]);
-  }
-  return layer;
-}
-
-std::vector<std::vector<double>> rows(
-  const YAML::Node & node, const std::string & path, std::size_t width)
-{
-  if (!node.IsSequence()) {
-    throw PolicyError("'" + path + "' is not a sequence");
-  }
-  std::vector<std::vector<double>> out;
-  out.reserve(node.size());
-  for (std::size_t i = 0; i < node.size(); ++i) {
-    const std::string row_path = path + "[" + std::to_string(i) + "]";
-    std::vector<double> row = doubles(node[i], row_path);
-    if (row.size() != width) {
-      throw PolicyError(
-              "'" + row_path + "' has " + std::to_string(row.size()) + " values, expected " +
-              std::to_string(width));
-    }
-    out.push_back(std::move(row));
-  }
-  return out;
 }
 
 }  // namespace
@@ -430,6 +274,19 @@ std::shared_ptr<MlpPolicy> MlpPolicy::load(const std::string & path)
   }
 }
 
+Eigen::VectorXd forward(
+  const std::vector<MlpPolicy::Layer> & layers, const Eigen::VectorXd & input)
+{
+  Eigen::VectorXd x = input;
+  for (std::size_t i = 0; i < layers.size(); ++i) {
+    x = layers[i].weight * x + layers[i].bias;
+    if (i + 1 < layers.size()) {
+      x = x.unaryExpr([](double value) {return std::tanh(value);});
+    }
+  }
+  return x;
+}
+
 Action MlpPolicy::act(const Eigen::VectorXd & observation) const
 {
   if (observation.size() != spec_.observation.dim) {
@@ -437,13 +294,7 @@ Action MlpPolicy::act(const Eigen::VectorXd & observation) const
             "observation has " + std::to_string(observation.size()) +
             " entries, the policy reads " + std::to_string(spec_.observation.dim));
   }
-  Eigen::VectorXd x = observation;
-  for (std::size_t i = 0; i < layers_.size(); ++i) {
-    x = layers_[i].weight * x + layers_[i].bias;
-    if (i + 1 < layers_.size()) {
-      x = x.unaryExpr([](double value) {return std::tanh(value);});
-    }
-  }
+  const Eigen::VectorXd x = forward(layers_, observation);
   Action action{};
   for (int k = 0; k < kActionSize; ++k) {
     action[k] = std::clamp(x(k), -1.0, 1.0);

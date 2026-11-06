@@ -144,6 +144,10 @@ private:
   GoldenCheck golden_check_;
 };
 
+// The network's raw outputs: tanh between the layers, nothing after the last.
+Eigen::VectorXd forward(
+  const std::vector<MlpPolicy::Layer> & layers, const Eigen::VectorXd & input);
+
 class PolicyBank
 {
 public:

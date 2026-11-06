@@ -13,6 +13,7 @@
 #include <geometry_msgs/msg/twist_stamped.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <vision_msgs/msg/classification.hpp>
 
 #include "as2_motion_controller/controller_base.hpp"
 #include "as2_msgs/msg/control_mode.hpp"
@@ -29,6 +30,12 @@ namespace rl_policy
 inline constexpr const char kStepLabel[] = "rl_policy_step_v2";
 inline constexpr std::size_t kStepColumns = 64;
 inline constexpr std::size_t kStepObservationColumns = 31;
+
+// Column layout of the takeover debug topic: t, mode, obstacle, gain, time to the gate, main's
+// action, the aim, the aimed action, the residual, then the row past the aimed action, NaN outside
+// the window. With the step topic, a flight's every tick can be replayed.
+inline constexpr const char kTakeoverLabel[] = "rl_policy_takeover_v1";
+inline constexpr std::size_t kTakeoverHeadColumns = 19;
 
 class Plugin : public as2_motion_controller_plugin_base::ControllerBase
 {
@@ -84,6 +91,12 @@ private:
     bool policies_named = false;
     std::string motor_speed_topic;
     double motor_speed_timeout_s = 0.0;
+    // Empty, no takeover.
+    std::string takeover_file;
+    std::string takeover_topic;
+    std::vector<std::string> takeover_gates;
+    std::vector<std::string> takeover_kinds;
+    BarSide takeover_one_at = BarSide::Left;
   };
 
   void readSettings(Settings & settings);
@@ -97,6 +110,8 @@ private:
 
   void motorSpeedCallback(const sensor_msgs::msg::JointState::SharedPtr msg);
 
+  void barReadingCallback(const vision_msgs::msg::Classification::SharedPtr msg);
+
   // course.source race_pilot: the race's course from as2_race_pilot's trajectory, while idle.
   void takeRacePilotCourse(const as2_msgs::msg::TrajectorySetpoints & ref);
 
@@ -107,6 +122,8 @@ private:
     geometry_msgs::msg::TwistStamped & twist, as2_msgs::msg::Thrust & thrust) const;
 
   void publishStep(const StepResult & result);
+
+  void publishTakeover(const StepResult & result);
 
   void publishStatus();
 
@@ -147,8 +164,10 @@ private:
   std::string course_state_ = "configured";
 
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr motor_speed_sub_;
+  rclcpp::Subscription<vision_msgs::msg::Classification>::SharedPtr bar_reading_sub_;
   rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr status_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr step_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr takeover_pub_;
   rclcpp::TimerBase::SharedPtr status_timer_;
 };
 
