@@ -1420,11 +1420,12 @@ TEST_F(PluginTest, TheDetectorsFramesReachTheTakeover) {
   EXPECT_EQ(takeover->readingsKept(), 1u);
   EXPECT_DOUBLE_EQ(takeover->readings().newest(), 99.97);
 
-  // An 80 Hz detector's next frame is thinned out.
+  // An 80 Hz detector's next frame comes between two steps of the history: the newest slot's.
   publishReading(99.9825, {{"gate07", 0.75}});
   spin(std::chrono::milliseconds(100));
   EXPECT_EQ(takeover->readingsSeen(), 3u);
-  EXPECT_EQ(takeover->readingsKept(), 1u);
+  EXPECT_EQ(takeover->readingsKept(), 2u);
+  EXPECT_DOUBLE_EQ(takeover->readings().newest(), 99.9825);
 
   setTime(100.01);
   ASSERT_TRUE(computeOutput());
@@ -1437,8 +1438,8 @@ TEST_F(PluginTest, TheDetectorsFramesReachTheTakeover) {
   EXPECT_EQ(status["takeover_mode"], "before");
   EXPECT_EQ(status["takeover_gate"], "gate07");
   EXPECT_EQ(status["takeover_readings_seen"], "3");
-  EXPECT_EQ(status["takeover_readings_kept"], "1");
-  EXPECT_NEAR(std::stod(status["takeover_reading_age_s"]), 0.53, 1e-6);
+  EXPECT_EQ(status["takeover_readings_kept"], "2");
+  EXPECT_NEAR(std::stod(status["takeover_reading_age_s"]), 0.5175, 1e-6);
 
   ASSERT_GE(takeovers_.size(), 2u);
   const std_msgs::msg::Float64MultiArray & tick = takeovers_.back();

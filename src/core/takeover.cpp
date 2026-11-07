@@ -184,9 +184,9 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
     expectString(root, "format", "", kTakeoverFormat);
     const int version =
       scalar<int>(required(root, "format_version", ""), "format_version", "integer");
-    if (version != kTakeoverFormatVersion) {
+    if (version < 1 || version > kTakeoverFormatVersion) {
       throw PolicyError(
-              "format_version " + std::to_string(version) + " is not supported, only " +
+              "format_version " + std::to_string(version) + " is not supported, only up to " +
               std::to_string(kTakeoverFormatVersion));
     }
 
@@ -215,6 +215,13 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
       throw PolicyError("'reading.history' must be at least 1");
     }
     spec.reading_hz = positiveDouble(required(reading, "hz", "reading"), "reading.hz");
+    const YAML::Node frames = reading["frame_hz"];
+    if (frames.IsDefined() && !frames.IsNull()) {
+      spec.frame_hz = finiteDouble(frames, "reading.frame_hz");
+      if (spec.frame_hz < 0.0) {
+        throw PolicyError("'reading.frame_hz' must not be negative");
+      }
+    }
     spec.max_age_s = positiveDouble(required(reading, "max_age_s", "reading"), "reading.max_age_s");
     spec.time_scale_s =
       positiveDouble(required(reading, "time_scale_s", "reading"), "reading.time_scale_s");
@@ -332,8 +339,8 @@ std::vector<BarKind> barKinds(
   return out;
 }
 
-BarReadings::BarReadings(int history, double hz, double max_age_s)
-: period_s_(1.0 / hz), max_age_s_(max_age_s)
+BarReadings::BarReadings(int history, double hz, double max_age_s, bool latest)
+: period_s_(1.0 / hz), max_age_s_(max_age_s), latest_(latest)
 {
   stamps_.resize(static_cast<std::size_t>(history));
   values_.resize(static_cast<std::size_t>(history));
@@ -349,8 +356,15 @@ void BarReadings::clear()
 
 bool BarReadings::add(double stamp, const std::array<double, 2> & values)
 {
-  if (!(stamp > stamps_.front()) || stamp < next_due_ - kThinningToleranceS) {
+  if (!(stamp > stamps_.front())) {
     return false;
+  }
+  if (stamp < next_due_ - kThinningToleranceS) {
+    if (latest_) {
+      stamps_.front() = stamp;
+      values_.front() = values;
+    }
+    return latest_;
   }
   next_due_ += period_s_;
   if (next_due_ <= stamp) {
@@ -384,7 +398,8 @@ Takeover::Takeover(
   std::shared_ptr<const TakeoverNetworks> networks, std::vector<BarKind> kinds, BarSide one_at)
 : networks_(std::move(networks)), kinds_(std::move(kinds)), one_at_(one_at),
   readings_(
-    networks_->spec().history, networks_->spec().reading_hz, networks_->spec().max_age_s)
+    networks_->spec().history, networks_->spec().reading_hz, networks_->spec().max_age_s,
+    networks_->spec().frame_hz > 0.0)
 {
   if (kinds_.size() != networks_->spec().gates.size()) {
     throw std::invalid_argument(
@@ -440,6 +455,11 @@ bool Takeover::addReading(const std::string & gate, double position, double stam
 void Takeover::keepValues(double stamp, const std::array<double, 2> & values)
 {
   readings_.keep(stamp, values);
+}
+
+bool Takeover::addValues(double stamp, const std::array<double, 2> & values)
+{
+  return readings_.add(stamp, values);
 }
 
 double Takeover::beyond(const VehicleState & state, const Course & course) const

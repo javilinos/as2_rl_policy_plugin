@@ -179,7 +179,9 @@ the frame's, on the clock the controller runs on. A sliding bar's position `p` b
 (`1 - 2 p` for a `horizontal` bar with its 1 on the left), a rotating bar's angle `p` times 179
 degrees becomes the sine and cosine of twice it. The file's `reading.hz` is the rate the networks
 trained on; a faster detector is thinned to it, because `reading.history` readings at its own rate
-would span a fraction of the time the networks read the bar's motion over. No reading is not an
+would span a fraction of the time the networks read the bar's motion over. With `reading.frame_hz`
+in the file, the networks trained on the detector's every frame: a frame between two steps of the
+history replaces the newest reading, and only the rest of the history is thinned. No reading is not an
 error: frames are lost in training too, and a reading gone past `reading.max_age_s` reads as none.
 The status carries `takeover_mode`, `takeover_gate`, `takeover_gain`, `takeover_readings_seen`,
 `takeover_readings_kept` and `takeover_reading_age_s`, and `debug.takeover_topic` publishes every

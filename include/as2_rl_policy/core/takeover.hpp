@@ -31,7 +31,8 @@ namespace rl_policy
 {
 
 inline constexpr const char kTakeoverFormat[] = "quadlab_takeover";
-inline constexpr int kTakeoverFormatVersion = 1;
+// 2 adds reading.frame_hz: a reader that skips it thins the frames its networks expect whole, so it must refuse the file.
+inline constexpr int kTakeoverFormatVersion = 2;
 // main's row: the R6 block and two commands.
 inline constexpr int kMainRowSize = 31;
 inline constexpr int kAimSize = 2;
@@ -109,6 +110,9 @@ struct TakeoverSpec
   double handback_m = 0.0;
   int history = 0;
   double reading_hz = 0.0;
+  // Positive: the networks trained on the detector's every frame in the newest slot, the history
+  // moving at reading_hz. Zero: one frame per reading.
+  double frame_hz = 0.0;
   double max_age_s = 0.0;
   double time_scale_s = 0.0;
   std::vector<TakeoverGate> gates;
@@ -156,15 +160,17 @@ std::vector<BarKind> barKinds(
 
 // The last readings of one obstacle, newest first. A detector faster than the rate the networks
 // trained on is thinned to it: at its own rate, the history would span a fraction of the time
-// they read the bar's motion over.
+// they read the bar's motion over. With `latest`, a frame between two steps of the history
+// replaces the newest reading instead of being dropped, so the newest is always the latest frame.
 class BarReadings
 {
 public:
-  BarReadings(int history, double hz, double max_age_s);
+  BarReadings(int history, double hz, double max_age_s, bool latest = false);
 
   void clear();
 
-  // A reading stamped with its frame's time; false when late, repeated or thinned out.
+  // A reading stamped with its frame's time; false when late, repeated or thinned out, which a
+  // reading with `latest` never is.
   bool add(double stamp, const std::array<double, 2> & values);
 
   // A reading kept whatever its time, past the thinning.
@@ -179,6 +185,7 @@ public:
 private:
   double period_s_;
   double max_age_s_;
+  bool latest_;
   double next_due_ = -std::numeric_limits<double>::infinity();
   std::vector<double> stamps_;
   std::vector<std::array<double, 2>> values_;
@@ -215,6 +222,9 @@ public:
 
   // A reading in the row's values, past the thinning and the gate.
   void keepValues(double stamp, const std::array<double, 2> & values);
+
+  // A reading in the row's values, past the gate alone.
+  bool addValues(double stamp, const std::array<double, 2> & values);
 
   // This tick's window, on the estimate and the target.
   void advance(const VehicleState & state, const Course & course, std::size_t target);

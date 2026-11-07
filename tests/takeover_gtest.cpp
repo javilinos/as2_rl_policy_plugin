@@ -266,6 +266,28 @@ TEST(TakeoverFile, IsRefusedWhenItsWeightsMissItsGoldens) {
   EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
 }
 
+TEST(TakeoverFile, WithoutFramesReadsOneFramePerReading) {
+  YAML::Node doc = rl_policy_test::loadFixture("takeover.yaml");
+  ASSERT_TRUE(doc["reading"]["frame_hz"].IsDefined());
+  EXPECT_EQ(networks()->spec().frame_hz, 80.0);
+  doc["reading"].remove("frame_hz");
+  const auto older = TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover"));
+  EXPECT_EQ(older->spec().frame_hz, 0.0);
+  doc["reading"]["frame_hz"] = -1.0;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
+TEST(TakeoverFile, IsReadFromItsFirstVersionToItsLast) {
+  YAML::Node doc = rl_policy_test::loadFixture("takeover.yaml");
+  EXPECT_EQ(doc["format_version"].as<int>(), rl_policy::kTakeoverFormatVersion);
+  doc["format_version"] = 1;
+  EXPECT_NO_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")));
+  doc["format_version"] = 0;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+  doc["format_version"] = rl_policy::kTakeoverFormatVersion + 1;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
 TEST(TakeoverFile, IsRefusedWithAnotherHistoryThanItsNetworksRead) {
   YAML::Node doc = rl_policy_test::loadFixture("takeover.yaml");
   doc["reading"]["history"] = 8;
@@ -353,6 +375,34 @@ TEST(Readings, AtEightyHertzAreThinnedToTheRateTheNetworksTrainedOn) {
   Eigen::VectorXd out(30);
   readings.write(kept.back(), out);
   EXPECT_GT(out(29), 0.45);
+}
+
+TEST(Readings, WithLatestTheNewestIsEveryFrameAndTheHistoryKeepsItsRate) {
+  BarReadings readings(10, 18.0, 1.0, true);
+  for (int frame = 0; frame < 160; ++frame) {
+    const double stamp = 5.0 + frame / 80.0;
+    EXPECT_TRUE(readings.add(stamp, {static_cast<double>(frame), 0.0}));
+    EXPECT_EQ(readings.newest(), stamp);
+  }
+  Eigen::VectorXd out(30);
+  readings.write(5.0 + 159.0 / 80.0, out);
+  EXPECT_EQ(out(0), 159.0);
+  EXPECT_EQ(out(2), 0.0);
+  for (int slot = 2; slot < 10; ++slot) {
+    const double step = out(3 * slot + 2) - out(3 * (slot - 1) + 2);
+    EXPECT_GE(step, 0.05 - 1e-9) << "slot " << slot;
+    EXPECT_LE(step, 0.0625 + 1e-9) << "slot " << slot;
+  }
+}
+
+TEST(Readings, WithLatestStillRefuseALateOrARepeatedFrame) {
+  BarReadings readings(10, 18.0, 1.0, true);
+  EXPECT_TRUE(readings.add(2.0, {0.5, 0.0}));
+  EXPECT_FALSE(readings.add(2.0, {0.25, 0.0}));
+  EXPECT_FALSE(readings.add(1.5, {0.25, 0.0}));
+  Eigen::VectorXd out(30);
+  readings.write(2.0, out);
+  EXPECT_EQ(out(0), 0.5);
 }
 
 TEST(Readings, AtTheTrainedRateAreAllKept) {
@@ -519,7 +569,11 @@ TEST(TakeoverTrace, IsWhatTheEnvFlew) {
       ASSERT_EQ(pilot.obstacle(), static_cast<std::size_t>(tick[kObstacle])) << where;
       ASSERT_NEAR(pilot.gain(), tick[kGain], tolerance) << where;
       if (tick[kReading] != 0.0) {
-        pilot.keepValues(t - delay, {tick[kValues], tick[kValues + 1]});
+        if (networks()->spec().frame_hz > 0.0) {
+          ASSERT_TRUE(pilot.addValues(t - delay, {tick[kValues], tick[kValues + 1]})) << where;
+        } else {
+          pilot.keepValues(t - delay, {tick[kValues], tick[kValues + 1]});
+        }
         ++readings;
       }
       const Action action = pilot.act(*main, row, state, course, t);
