@@ -104,6 +104,8 @@ const char * toString(BarKind kind)
       return "horizontal";
     case BarKind::Rotating:
       return "rotating";
+    case BarKind::None:
+      return "none";
   }
   return "unknown";
 }
@@ -139,7 +141,10 @@ BarKind barKindFromString(const std::string & name)
   if (name == "rotating") {
     return BarKind::Rotating;
   }
-  throw std::invalid_argument("'" + name + "' is none of vertical, horizontal, rotating");
+  if (name == "none") {
+    return BarKind::None;
+  }
+  throw std::invalid_argument("'" + name + "' is none of vertical, horizontal, rotating, none");
 }
 
 BarSide barSideFromString(const std::string & name)
@@ -325,7 +330,9 @@ std::vector<BarKind> barKinds(
     }
     const std::size_t at = static_cast<std::size_t>(it - gates.begin());
     const BarKind kind = barKindFromString(kinds[at]);
-    if (std::find(gate.kinds.begin(), gate.kinds.end(), kind) == gate.kinds.end()) {
+    if (kind != BarKind::None &&
+      std::find(gate.kinds.begin(), gate.kinds.end(), kind) == gate.kinds.end())
+    {
       throw std::invalid_argument(
               "the networks did not train on a " + kinds[at] + " bar in '" + gate.name + "'");
     }
@@ -406,6 +413,11 @@ Takeover::Takeover(
             "the takeover has " + std::to_string(kinds_.size()) + " bar kinds for " +
             std::to_string(networks_->spec().gates.size()) + " gates");
   }
+  if (std::all_of(
+      kinds_.begin(), kinds_.end(), [](BarKind kind) {return kind == BarKind::None;}))
+  {
+    throw std::invalid_argument("the takeover has no bar in any of its gates");
+  }
 }
 
 void Takeover::start(std::size_t target, std::size_t gates)
@@ -421,7 +433,7 @@ std::size_t Takeover::nextObstacle(std::size_t target, std::size_t gates) const
   const auto & barred = networks_->spec().gates;
   for (std::size_t i = 0; i < barred.size(); ++i) {
     const std::size_t ahead = (barred[i].index + gates - target) % gates;
-    if (ahead < best) {
+    if (kinds_[i] != BarKind::None && ahead < best) {
       best = ahead;
       next = i;
     }
@@ -506,11 +518,9 @@ void Takeover::advance(const VehicleState & state, const Course & course, std::s
     }
   }
   if (mode_ == TakeoverMode::Tail) {
-    const std::size_t next = nextObstacle(target, gates);
-    if (next != obstacle_) {
-      obstacle_ = next;
-      open();
-    }
+    // With one bar standing the next obstacle is the same gate, a lap on.
+    obstacle_ = nextObstacle(target, gates);
+    open();
   }
 }
 

@@ -48,6 +48,8 @@ enum class BarKind
   UpDown = 0,
   LeftRight = 1,
   Rotating = 2,
+  // No bar stands in that gate: its window never opens and the race policy flies it alone.
+  None = 3,
 };
 
 // The side of the approach a detector's position of 1 puts a left-right bar on. The networks
@@ -74,7 +76,7 @@ const char * toString(BarSide side);
 const char * toString(TakeoverMode mode);
 
 // The word of a mission's obstacles: throws std::invalid_argument for anything but "vertical",
-// "horizontal" or "rotating".
+// "horizontal" or "rotating", or "none" for a gate without its bar.
 BarKind barKindFromString(const std::string & name);
 
 // Throws std::invalid_argument for anything but "left" or "right".
@@ -153,7 +155,7 @@ private:
 
 // The bar kinds of the file's gates, in its order, from the gates a flight names and what stands
 // in each. Throws std::invalid_argument unless they are the file's gates, each with a bar it
-// trained on.
+// trained on or none: a gate left out is a mistake, a gate without its bar is said.
 std::vector<BarKind> barKinds(
   const TakeoverSpec & spec, const std::vector<std::string> & gates,
   const std::vector<std::string> & kinds);

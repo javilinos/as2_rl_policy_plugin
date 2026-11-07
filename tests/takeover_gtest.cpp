@@ -300,6 +300,18 @@ TEST(BarKinds, FollowTheFilesGatesInAnyOrderNamed) {
     (std::vector<BarKind>{BarKind::LeftRight, BarKind::Rotating}));
 }
 
+TEST(BarKinds, TakeNoneForAGateWithoutItsBar) {
+  const rl_policy::TakeoverSpec & spec = networks()->spec();
+  EXPECT_EQ(
+    rl_policy::barKinds(spec, {"gate07", "gate12_oct"}, {"horizontal", "none"}),
+    (std::vector<BarKind>{BarKind::LeftRight, BarKind::None}));
+  // Said, not forgotten: a gate left out is still refused.
+  EXPECT_THROW(rl_policy::barKinds(spec, {"gate07"}, {"horizontal"}), std::invalid_argument);
+  EXPECT_THROW(
+    Takeover(networks(), std::vector<BarKind>{BarKind::None, BarKind::None}, BarSide::Left),
+    std::invalid_argument);
+}
+
 TEST(BarKinds, RefuseWhatTheNetworksDidNotTrainOn) {
   const rl_policy::TakeoverSpec & spec = networks()->spec();
   EXPECT_THROW(
@@ -517,6 +529,46 @@ TEST(TakeoverTick, MovesToTheNextObstacleOnlyWhenTheHandBackIsOver) {
   EXPECT_EQ(pilot->mode(), TakeoverMode::Before);
   EXPECT_EQ(pilot->obstacle(), 1u);
   EXPECT_EQ(pilot->readings().newest(), -std::numeric_limits<double>::infinity());
+}
+
+TEST(TakeoverTick, WithOneBarStandingComesBackToItsGateEveryLap) {
+  const std::vector<rl_policy::Gate> gates = trainedGates();
+  const Course course(gates);
+  Takeover pilot(
+    networks(), std::vector<BarKind>{BarKind::LeftRight, BarKind::None}, BarSide::Left);
+  pilot.start(kGate07 + 1, course.size());
+  EXPECT_EQ(pilot.obstacle(), 0u);
+  EXPECT_FALSE(pilot.addReading("gate12_oct", 0.5, 1.0));
+  for (int lap = 0; lap < 3; ++lap) {
+    for (int i = 0; i < 6; ++i) {
+      pilot.advance(nearGate(gates[kGate07], -1.0), course, kGate07);
+    }
+    EXPECT_EQ(pilot.mode(), TakeoverMode::Active);
+    EXPECT_GT(pilot.gain(), 0.0);
+    EXPECT_TRUE(pilot.addReading("gate07", 0.5, 1.0 + lap));
+    pilot.advance(nearGate(gates[kGate07], 3.1), course, kGate07 + 1);
+    EXPECT_EQ(pilot.mode(), TakeoverMode::HandingBack);
+    for (int i = 0; i < 11; ++i) {
+      pilot.advance(nearGate(gates[kGate07], 3.2), course, kGate07 + 1);
+    }
+    EXPECT_EQ(pilot.mode(), TakeoverMode::Before);
+    EXPECT_EQ(pilot.gain(), 0.0);
+    EXPECT_EQ(pilot.obstacle(), 0u);
+  }
+}
+
+TEST(TakeoverTick, NeverOpensAGateWithoutItsBar) {
+  const std::vector<rl_policy::Gate> gates = trainedGates();
+  const Course course(gates);
+  Takeover pilot(
+    networks(), std::vector<BarKind>{BarKind::UpDown, BarKind::None}, BarSide::Left);
+  pilot.start(kGate12 - 1, course.size());
+  EXPECT_EQ(pilot.obstacle(), 0u);
+  for (const std::size_t target : {kGate12 - 1, kGate12, kGate12 + 1 - course.size()}) {
+    pilot.advance(nearGate(gates[kGate12], -1.0), course, target);
+    EXPECT_EQ(pilot.mode(), TakeoverMode::Before);
+    EXPECT_EQ(pilot.gain(), 0.0);
+  }
 }
 
 TEST(TakeoverTick, OpensGate12sWindowBeforeTheGateBeforeIt) {

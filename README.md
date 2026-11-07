@@ -166,7 +166,9 @@ With a file, three keys more are required:
 
 - `takeover.gates` and `takeover.kinds`: what stands in each barred gate, the file's gates by
   name, in any order, in the words of the mission's `obstacles`: `vertical`, `horizontal`,
-  `rotating`. A bar the networks did not train on in that gate is refused.
+  `rotating`. A bar the networks did not train on in that gate is refused. `none` says a gate
+  stands without its bar: its window never opens and the race policy flies it alone. A gate left
+  out of `takeover.gates` is still refused, so a bar is never forgotten.
 - `takeover.left_right_one_at`: `left` or `right`, the side of the approach a `horizontal` bar's
   position 1 is on. The networks trained with it on the right; `obstacle_gates` reports the
   gate's left, so `left` until the detector changes.
