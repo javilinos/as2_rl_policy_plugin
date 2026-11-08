@@ -50,6 +50,71 @@ std::vector<MlpPolicy::Layer> parseNetwork(
   return layers;
 }
 
+// A recurrent aim: the row's columns it reads, their standardization, and its four layers.
+MemoryAim parseMemoryAim(const YAML::Node & aim, Eigen::Index width)
+{
+  const YAML::Node memory = required(aim, "memory", "aim");
+  MemoryAim out;
+  const YAML::Node columns = required(memory, "columns", "aim.memory");
+  if (!columns.IsSequence() || columns.size() == 0) {
+    throw PolicyError("'aim.memory.columns' must be a non-empty sequence");
+  }
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    const std::string path = "aim.memory.columns[" + std::to_string(i) + "]";
+    const int column = scalar<int>(columns[i], path, "integer");
+    if (column < 0 || column >= width) {
+      throw PolicyError(
+              "'" + path + "' is " + std::to_string(column) + ", not a column of the row's " +
+              std::to_string(width));
+    }
+    out.columns.push_back(column);
+  }
+  const auto count = static_cast<Eigen::Index>(out.columns.size());
+  const auto standardization = [&memory, count](const char * key) {
+      const std::string path = std::string("aim.memory.") + key;
+      const std::vector<double> values = doubles(required(memory, key, "aim.memory"), path);
+      if (static_cast<Eigen::Index>(values.size()) != count) {
+        throw PolicyError(
+                "'" + path + "' has " + std::to_string(values.size()) + " values for " +
+                std::to_string(count) + " columns");
+      }
+      Eigen::VectorXd standard(count);
+      for (Eigen::Index i = 0; i < count; ++i) {
+        standard(i) = float32(values[static_cast<std::size_t>(i)]);
+      }
+      return standard;
+    };
+  out.mean = standardization("mean");
+  out.std = standardization("std");
+  if (!(out.std.array() > 0.0).all()) {
+    throw PolicyError("'aim.memory.std' must be positive");
+  }
+  const YAML::Node layers = required(aim, "layers", "aim");
+  if (!layers.IsSequence() || layers.size() != 4) {
+    throw PolicyError(
+            "a recurrent aim's 'aim.layers' are four: the input layer, the GRU's input weights, "
+            "its memory's weights and the head");
+  }
+  MlpPolicy::Layer * parts[] = {&out.input, &out.from_input, &out.from_memory, &out.head};
+  for (std::size_t i = 0; i < 4; ++i) {
+    *parts[i] = parseLayer(layers[i], "aim.layers[" + std::to_string(i) + "]");
+  }
+  const Eigen::Index hidden = out.size();
+  const Eigen::Index shapes[4][2] = {
+    {hidden, count}, {3 * hidden, hidden}, {3 * hidden, hidden}, {kAimSize, hidden}};
+  for (std::size_t i = 0; i < 4; ++i) {
+    if (parts[i]->weight.rows() != shapes[i][0] || parts[i]->weight.cols() != shapes[i][1]) {
+      throw PolicyError(
+              "'aim.layers[" + std::to_string(i) + "]' is [" +
+              std::to_string(parts[i]->weight.rows()) + ", " +
+              std::to_string(parts[i]->weight.cols()) + "], a recurrent aim of " +
+              std::to_string(hidden) + " on " + std::to_string(count) + " columns needs [" +
+              std::to_string(shapes[i][0]) + ", " + std::to_string(shapes[i][1]) + "]");
+    }
+  }
+  return out;
+}
+
 TakeoverGate parseGate(const YAML::Node & node, const std::string & path)
 {
   TakeoverGate gate;
@@ -168,9 +233,34 @@ std::array<double, 2> barValues(BarKind kind, double position, BarSide one_at)
   return {kind == BarKind::LeftRight && one_at == BarSide::Left ? -place : place, 0.0};
 }
 
+Eigen::Vector2d MemoryAim::step(const Eigen::VectorXd & row, Eigen::VectorXd & memory) const
+{
+  Eigen::VectorXd picked(static_cast<Eigen::Index>(columns.size()));
+  for (std::size_t i = 0; i < columns.size(); ++i) {
+    const auto at = static_cast<Eigen::Index>(i);
+    picked(at) = (row(columns[i]) - mean(at)) / std(at);
+  }
+  const Eigen::VectorXd x = (input.weight * picked + input.bias).array().tanh().matrix();
+  const Eigen::Index n = size();
+  const Eigen::VectorXd from_x = from_input.weight * x + from_input.bias;
+  const Eigen::VectorXd from_h = from_memory.weight * memory + from_memory.bias;
+  const auto sigmoid = [](double value) {return 1.0 / (1.0 + std::exp(-value));};
+  const Eigen::ArrayXd reset = (from_x.head(n) + from_h.head(n)).unaryExpr(sigmoid).array();
+  const Eigen::ArrayXd keep = (from_x.segment(n, n) + from_h.segment(n, n)).unaryExpr(sigmoid).array();
+  const Eigen::ArrayXd fresh = (from_x.tail(n).array() + from_h.tail(n).array() * reset).tanh();
+  memory = (keep * memory.array() + (1.0 - keep) * fresh).matrix();
+  return (head.weight * memory + head.bias).cwiseMax(-1.0).cwiseMin(1.0);
+}
+
 TakeoverNetworks::TakeoverNetworks(
   TakeoverSpec spec, std::vector<MlpPolicy::Layer> aim, std::vector<MlpPolicy::Layer> residual)
 : spec_(std::move(spec)), aim_(std::move(aim)), residual_(std::move(residual))
+{
+}
+
+TakeoverNetworks::TakeoverNetworks(
+  TakeoverSpec spec, MemoryAim aim, std::vector<MlpPolicy::Layer> residual)
+: spec_(std::move(spec)), memory_aim_(std::move(aim)), residual_(std::move(residual))
 {
 }
 
@@ -230,6 +320,18 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
     spec.max_age_s = positiveDouble(required(reading, "max_age_s", "reading"), "reading.max_age_s");
     spec.time_scale_s =
       positiveDouble(required(reading, "time_scale_s", "reading"), "reading.time_scale_s");
+    const YAML::Node show = root["show_aim"];
+    if (show.IsDefined() && !show.IsNull()) {
+      spec.show_aim = scalar<bool>(show, "show_aim", "boolean");
+    }
+    const YAML::Node aim_node = required(root, "aim", "");
+    const bool recurrent =
+      aim_node.IsMap() && aim_node["memory"].IsDefined() && !aim_node["memory"].IsNull();
+    if (version < 3 && (spec.show_aim || recurrent)) {
+      throw PolicyError(
+              "format_version " + std::to_string(version) +
+              " holds no recurrent aim or show_aim: they came with 3");
+    }
 
     const YAML::Node gates = required(root, "gates", "");
     if (!gates.IsSequence() || gates.size() < 2) {
@@ -249,9 +351,14 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
     spec.aim_sha256 = optionalString(source, "aim_checkpoint_sha256", "unknown");
 
     const int width = spec.width();
-    auto networks = std::make_shared<TakeoverNetworks>(
-      std::move(spec), parseNetwork(root, "aim", width, kAimSize),
-      parseNetwork(root, "residual", width, kActionSize));
+    const int residual_width = spec.residualWidth();
+    const bool show_aim = spec.show_aim;
+    auto residual = parseNetwork(root, "residual", residual_width, kActionSize);
+    auto networks = recurrent ?
+      std::make_shared<TakeoverNetworks>(
+      std::move(spec), parseMemoryAim(aim_node, width), std::move(residual)) :
+      std::make_shared<TakeoverNetworks>(
+      std::move(spec), parseNetwork(root, "aim", width, kAimSize), std::move(residual));
 
     const YAML::Node golden = required(root, "golden", "");
     const double tolerance =
@@ -262,13 +369,22 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
     const auto inputs =
       rows(required(golden, "input", "golden"), "golden.input", static_cast<std::size_t>(width));
     const auto aims = rows(required(golden, "aim", "golden"), "golden.aim", kAimSize);
+    // With show_aim the residual reads rows of its own.
+    const auto residual_inputs = show_aim ?
+      rows(
+      required(golden, "residual_input", "golden"), "golden.residual_input",
+      static_cast<std::size_t>(residual_width)) :
+      inputs;
     const auto residuals =
       rows(required(golden, "residual", "golden"), "golden.residual", kActionSize);
-    if (inputs.size() != aims.size() || inputs.size() != residuals.size()) {
+    if (inputs.size() != aims.size() || inputs.size() != residuals.size() ||
+      inputs.size() != residual_inputs.size())
+    {
       throw PolicyError(
               "'golden.input' has " + std::to_string(inputs.size()) + " rows, 'golden.aim' " +
               std::to_string(aims.size()) + ", 'golden.residual' " +
-              std::to_string(residuals.size()));
+              std::to_string(residuals.size()) + ", the residual's input " +
+              std::to_string(residual_inputs.size()));
     }
     if (inputs.empty()) {
       throw PolicyError("'golden' carries no rows, the networks cannot be checked");
@@ -277,11 +393,15 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
     MlpPolicy::GoldenCheck check;
     check.rows = inputs.size();
     check.tolerance = tolerance;
+    // A recurrent aim's rows are one sequence, from no memory.
+    Eigen::VectorXd memory = Eigen::VectorXd::Zero(networks->memorySize());
     for (std::size_t row = 0; row < inputs.size(); ++row) {
       const Eigen::VectorXd input = Eigen::Map<const Eigen::VectorXd>(
         inputs[row].data(), static_cast<Eigen::Index>(inputs[row].size()));
-      const Eigen::Vector2d aim = networks->aim(input);
-      const Action residual = networks->residual(input);
+      const Eigen::VectorXd residual_input = Eigen::Map<const Eigen::VectorXd>(
+        residual_inputs[row].data(), static_cast<Eigen::Index>(residual_inputs[row].size()));
+      const Eigen::Vector2d aim = networks->aim(input, memory);
+      const Action residual = networks->residual(residual_input);
       double error = std::max(std::abs(aim.x() - aims[row][0]), std::abs(aim.y() - aims[row][1]));
       for (int k = 0; k < kActionSize; ++k) {
         error = std::max(error, std::abs(residual[k] - residuals[row][k]));
@@ -301,8 +421,11 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
   }
 }
 
-Eigen::Vector2d TakeoverNetworks::aim(const Eigen::VectorXd & row) const
+Eigen::Vector2d TakeoverNetworks::aim(const Eigen::VectorXd & row, Eigen::VectorXd & memory) const
 {
+  if (memory_aim_) {
+    return memory_aim_->step(row, memory);
+  }
   return forward(aim_, row).cwiseMax(-1.0).cwiseMin(1.0);
 }
 
@@ -418,6 +541,7 @@ Takeover::Takeover(
   {
     throw std::invalid_argument("the takeover has no bar in any of its gates");
   }
+  memory_ = Eigen::VectorXd::Zero(networks_->memorySize());
 }
 
 void Takeover::start(std::size_t target, std::size_t gates)
@@ -447,6 +571,16 @@ void Takeover::open()
   gain_ = 0.0;
   clock_s_ = 0.0;
   readings_.clear();
+  memory_.setZero();
+}
+
+bool Takeover::near() const
+{
+  if (mode_ == TakeoverMode::Tail || gates_ == 0) {
+    return false;
+  }
+  const std::size_t before = (networks_->spec().gates[obstacle_].index + gates_ - 1) % gates_;
+  return (target_ % gates_ + gates_ - before) % gates_ <= 2;
 }
 
 bool Takeover::addReading(const std::string & gate, double position, double stamp)
@@ -495,6 +629,8 @@ void Takeover::advance(const VehicleState & state, const Course & course, std::s
   const std::size_t gates = course.size();
   const TakeoverGate & gate = spec.gates[obstacle_];
   clock_s_ += spec.dt;
+  target_ = target;
+  gates_ = gates;
 
   const bool early = target == (gate.index + gates - 1) % gates && tau(state, course) < gate.open_s;
   if (mode_ == TakeoverMode::Before && (target == gate.index || early)) {
@@ -536,7 +672,11 @@ Action Takeover::act(
   tick_.tau_s = tau(state, course);
   tick_.main = clip(main.act(row));
   tick_.aimed = tick_.main;
-  if (!(gain_ > 0.0)) {
+  // A recurrent aim remembers its whole approach, gain or none, as it trained; away from it, nothing.
+  const bool recurrent = networks_->recurrent();
+  const bool remembering = recurrent && near();
+  if (!(gain_ > 0.0) && !remembering) {
+    memory_.setZero();
     return tick_.main;
   }
 
@@ -554,14 +694,33 @@ Action Takeover::act(
   input = asTrained(input);
 
   // The aim's job ends at the plane, and past it it was never taught.
-  if (beyond(state, course) < 0.0) {
-    tick_.aim = networks_->aim(input);
+  const bool ahead = beyond(state, course) < 0.0;
+  Eigen::Vector2d aim = Eigen::Vector2d::Zero();
+  if (recurrent) {
+    aim = networks_->aim(input, memory_);
+    if (!remembering) {
+      memory_.setZero();
+    }
+  } else if (ahead) {
+    aim = networks_->aim(input, memory_);
+  }
+  if (!(gain_ > 0.0)) {
+    return tick_.main;
+  }
+  if (ahead) {
+    tick_.aim = aim;
     Eigen::VectorXd shifted = row;
     shifted.segment<kAimSize>(1) -= spec.aim_m * gain_ * tick_.aim;
     tick_.aimed = clip(main.act(asTrained(shifted)));
     for (int k = 0; k < kActionSize; ++k) {
       input(kMainRowSize + k) = static_cast<float>(tick_.aimed[k]);
     }
+  }
+  if (spec.show_aim) {
+    const Eigen::VectorXd shown = asTrained(Eigen::VectorXd(gain_ * tick_.aim));
+    Eigen::VectorXd wide(spec.residualWidth());
+    wide << input.head(width - 1), shown, input.tail(1);
+    input = wide;
   }
   tick_.residual = networks_->residual(input);
   tick_.row = input;

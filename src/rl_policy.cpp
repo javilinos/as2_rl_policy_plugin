@@ -1182,7 +1182,7 @@ void Plugin::publishTakeover(const StepResult & result)
   }
   const TakeoverTick & tick = *result.takeover;
   const Eigen::Index tail = kMainRowSize + kActionSize;
-  const Eigen::Index tail_columns = mission_->takeover()->networks().spec().width() - tail;
+  const Eigen::Index tail_columns = mission_->takeover()->networks().spec().residualWidth() - tail;
   std_msgs::msg::Float64MultiArray msg;
   msg.layout.dim.resize(1);
   msg.layout.dim[0].label = kTakeoverLabel;

@@ -11,6 +11,10 @@
 //
 // The readings are the detector's, of the next obstacle only, and the networks see nothing else of
 // the bar: not its speed, not where it will be.
+//
+// A recurrent aim (quadlab.envs.takeover.MemoryAim) reads its columns of the row on every tick from
+// the gate before its bar to the hand-back, gain or none, and forgets outside that. With show_aim
+// the residual's row also holds g * aim, zero past the plane, in two columns before g.
 
 #include <Eigen/Dense>
 
@@ -19,6 +23,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,7 +37,8 @@ namespace rl_policy
 
 inline constexpr const char kTakeoverFormat[] = "quadlab_takeover";
 // 2 adds reading.frame_hz: a reader that skips it thins the frames its networks expect whole, so it must refuse the file.
-inline constexpr int kTakeoverFormatVersion = 2;
+// 3 adds the recurrent aim (aim.memory) and show_aim, which a reader before it would fly as neither.
+inline constexpr int kTakeoverFormatVersion = 3;
 // main's row: the R6 block and two commands.
 inline constexpr int kMainRowSize = 31;
 inline constexpr int kAimSize = 2;
@@ -117,15 +123,39 @@ struct TakeoverSpec
   double frame_hz = 0.0;
   double max_age_s = 0.0;
   double time_scale_s = 0.0;
+  // The residual also reads g * aim, in two columns before the gain.
+  bool show_aim = false;
   std::vector<TakeoverGate> gates;
   PolicySource source;
   std::string aim_checkpoint;
   std::string aim_sha256;
 
-  // The row's entries.
+  // The row's entries: what the aim reads.
   int width() const {return kMainRowSize + kActionSize + readingEntries() + kBarKinds + 2;}
 
+  // What the residual reads.
+  int residualWidth() const {return width() + (show_aim ? kAimSize : 0);}
+
   int readingEntries() const {return kReadingColumns * history;}
+};
+
+// quadlab.envs.takeover.MemoryAim: a tanh layer on standardized columns of the row, a GRU as torch
+// computes it, a linear head. The memory is the caller's.
+struct MemoryAim
+{
+  std::vector<Eigen::Index> columns;
+  Eigen::VectorXd mean;
+  Eigen::VectorXd std;
+  MlpPolicy::Layer input;
+  // The GRU's weights on its input and on its memory: reset, update and new, in torch's order.
+  MlpPolicy::Layer from_input;
+  MlpPolicy::Layer from_memory;
+  MlpPolicy::Layer head;
+
+  Eigen::Index size() const {return input.weight.rows();}
+
+  // One tick: moves `memory` on and returns the aim, clipped to [-1, 1].
+  Eigen::Vector2d step(const Eigen::VectorXd & row, Eigen::VectorXd & memory) const;
 };
 
 class TakeoverNetworks
@@ -134,14 +164,23 @@ public:
   TakeoverNetworks(
     TakeoverSpec spec, std::vector<MlpPolicy::Layer> aim, std::vector<MlpPolicy::Layer> residual);
 
+  TakeoverNetworks(TakeoverSpec spec, MemoryAim aim, std::vector<MlpPolicy::Layer> residual);
+
   // Parses a quadlab_takeover file and refuses it unless its goldens reproduce.
   static std::shared_ptr<const TakeoverNetworks> load(const std::string & path);
 
   const TakeoverSpec & spec() const {return spec_;}
 
-  // Both clipped to [-1, 1].
-  Eigen::Vector2d aim(const Eigen::VectorXd & row) const;
+  // The aim keeps a memory.
+  bool recurrent() const {return memory_aim_.has_value();}
 
+  // Its memory's size; 0 for an aim without one.
+  Eigen::Index memorySize() const {return recurrent() ? memory_aim_->size() : 0;}
+
+  // Both clipped to [-1, 1]. A recurrent aim moves `memory` on a tick; the other ignores it.
+  Eigen::Vector2d aim(const Eigen::VectorXd & row, Eigen::VectorXd & memory) const;
+
+  // The residual's own row, residualWidth() wide.
   Action residual(const Eigen::VectorXd & row) const;
 
   const MlpPolicy::GoldenCheck & goldenCheck() const {return golden_check_;}
@@ -149,6 +188,7 @@ public:
 private:
   TakeoverSpec spec_;
   std::vector<MlpPolicy::Layer> aim_;
+  std::optional<MemoryAim> memory_aim_;
   std::vector<MlpPolicy::Layer> residual_;
   MlpPolicy::GoldenCheck golden_check_;
 };
@@ -201,6 +241,7 @@ struct TakeoverTick
   double gain = 0.0;
   double tau_s = 0.0;
   Action main{};
+  // The aim before the plane, as it says it; zero past it, where nothing is applied.
   Eigen::Vector2d aim = Eigen::Vector2d::Zero();
   Action aimed{};
   Action residual{};
@@ -253,6 +294,13 @@ public:
 
   const BarReadings & readings() const {return readings_;}
 
+  // A recurrent aim's memory: zeros away from the obstacle.
+  const Eigen::VectorXd & memory() const {return memory_;}
+
+  // From the target being the gate before the obstacle to the hand-back's end: the approach a
+  // recurrent aim remembers.
+  bool near() const;
+
   // Detector results taken in, of any gate, and how many of them the row has held.
   std::uint64_t readingsSeen() const {return seen_;}
 
@@ -276,9 +324,13 @@ private:
   BarReadings readings_;
   TakeoverMode mode_ = TakeoverMode::Before;
   std::size_t obstacle_ = 0;
+  // The last advance()'s.
+  std::size_t target_ = 0;
+  std::size_t gates_ = 0;
   double clock_s_ = 0.0;
   double gain_ = 0.0;
   double gain_out_ = 0.0;
+  Eigen::VectorXd memory_;
   TakeoverTick tick_;
   std::uint64_t seen_ = 0;
   std::uint64_t kept_ = 0;

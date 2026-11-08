@@ -66,6 +66,14 @@ std::shared_ptr<const TakeoverNetworks> networks()
   return shared;
 }
 
+// A recurrent aim (format 3), and a residual that reads what it applies.
+std::shared_ptr<const TakeoverNetworks> memoryNetworks()
+{
+  static const auto shared =
+    TakeoverNetworks::load(rl_policy_test::fixturePath("takeover_memory.yaml"));
+  return shared;
+}
+
 std::shared_ptr<MlpPolicy> mainPolicy()
 {
   static const auto shared = MlpPolicy::load(rl_policy_test::fixturePath("takeover_main.yaml"));
@@ -279,12 +287,59 @@ TEST(TakeoverFile, WithoutFramesReadsOneFramePerReading) {
 
 TEST(TakeoverFile, IsReadFromItsFirstVersionToItsLast) {
   YAML::Node doc = rl_policy_test::loadFixture("takeover.yaml");
-  EXPECT_EQ(doc["format_version"].as<int>(), rl_policy::kTakeoverFormatVersion);
+  // Neither a recurrent aim nor show_aim: written at 2, for the plugins that fly today.
+  EXPECT_EQ(doc["format_version"].as<int>(), 2);
+  doc["format_version"] = rl_policy::kTakeoverFormatVersion;
+  EXPECT_NO_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")));
   doc["format_version"] = 1;
   EXPECT_NO_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")));
   doc["format_version"] = 0;
   EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
   doc["format_version"] = rl_policy::kTakeoverFormatVersion + 1;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
+TEST(TakeoverFile, WithARecurrentAimCarriesItsMemoryAndTheResidualsTwoColumns) {
+  const rl_policy::TakeoverSpec & spec = memoryNetworks()->spec();
+  EXPECT_TRUE(memoryNetworks()->recurrent());
+  EXPECT_EQ(memoryNetworks()->memorySize(), 128);
+  EXPECT_TRUE(spec.show_aim);
+  EXPECT_EQ(spec.width(), 70);
+  EXPECT_EQ(spec.residualWidth(), 72);
+  EXPECT_EQ(spec.frame_hz, 83.0);
+  EXPECT_EQ(spec.aim_m, 1.0);
+  EXPECT_EQ(spec.main_sha256, mainPolicy()->spec().source.checkpoint_sha256);
+  EXPECT_GE(memoryNetworks()->goldenCheck().rows, 64u);
+  EXPECT_LE(memoryNetworks()->goldenCheck().max_error, memoryNetworks()->goldenCheck().tolerance);
+  EXPECT_FALSE(networks()->recurrent());
+  EXPECT_EQ(networks()->memorySize(), 0);
+  EXPECT_FALSE(networks()->spec().show_aim);
+  EXPECT_EQ(networks()->spec().residualWidth(), 70);
+}
+
+TEST(TakeoverFile, HoldsARecurrentAimAndShowAimFromItsThirdVersionOn) {
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  EXPECT_EQ(doc["format_version"].as<int>(), 3);
+  doc["format_version"] = 2;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
+TEST(TakeoverFile, IsRefusedWhenItsRecurrentAimReadsPastTheRow) {
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  doc["aim"]["memory"]["columns"][0] = 70;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
+TEST(TakeoverFile, IsRefusedWhenItsAimsMemoryMissesItsGoldens) {
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  YAML::Node bias = doc["aim"]["layers"][2]["bias"];
+  bias[0] = bias[0].as<double>() + 0.5;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
+TEST(TakeoverFile, IsRefusedWhenTheResidualHasNoRowsOfItsOwn) {
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  doc["golden"].remove("residual_input");
   EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
 }
 
@@ -583,8 +638,71 @@ TEST(TakeoverTick, OpensGate12sWindowBeforeTheGateBeforeIt) {
   EXPECT_EQ(pilot->mode(), TakeoverMode::Active);
 }
 
-TEST(TakeoverTrace, IsWhatTheEnvFlew) {
-  const YAML::Node trace = rl_policy_test::loadFixture("takeover_trace.yaml");
+TEST(TakeoverTick, ARecurrentAimRemembersItsApproachAloneAndForgetsAtTheNext) {
+  const std::vector<rl_policy::Gate> gates = trainedGates();
+  const Course course(gates);
+  const auto main = mainPolicy();
+  Takeover pilot(
+    memoryNetworks(), std::vector<BarKind>{BarKind::UpDown, BarKind::Rotating}, BarSide::Right);
+  pilot.start(0, course.size());
+  ASSERT_EQ(pilot.obstacle(), 0u);
+  // Gate07's approach starts with the gate before it the target.
+  pilot.advance(nearGate(gates[kGate07 - 2], -3.0), course, kGate07 - 2);
+  EXPECT_FALSE(pilot.near());
+  pilot.act(*main, zeroRow(), nearGate(gates[kGate07 - 2], -3.0), course, 1.0);
+  EXPECT_EQ(pilot.memory().norm(), 0.0);
+  pilot.advance(nearGate(gates[kGate07 - 1], -3.0), course, kGate07 - 1);
+  EXPECT_TRUE(pilot.near());
+  EXPECT_EQ(pilot.gain(), 0.0);
+  pilot.act(*main, zeroRow(), nearGate(gates[kGate07 - 1], -3.0), course, 1.01);
+  EXPECT_GT(pilot.memory().norm(), 0.0);
+  EXPECT_EQ(pilot.tick().row.size(), 0);
+  // Through the window and the hand-back to gate12_oct's obstacle, which starts from nothing.
+  pilot.advance(nearGate(gates[kGate07], -1.0), course, kGate07);
+  pilot.advance(nearGate(gates[kGate07], -1.0), course, kGate07);
+  ASSERT_GT(pilot.gain(), 0.0);
+  pilot.act(*main, zeroRow(), nearGate(gates[kGate07], -1.0), course, 1.02);
+  EXPECT_EQ(pilot.tick().row.size(), 72);
+  pilot.advance(nearGate(gates[kGate07], 3.1), course, kGate07 + 1);
+  for (int i = 0; i < 11; ++i) {
+    pilot.advance(nearGate(gates[kGate07], 3.2), course, kGate07 + 1);
+  }
+  ASSERT_EQ(pilot.obstacle(), 1u);
+  EXPECT_EQ(pilot.memory().norm(), 0.0);
+  EXPECT_FALSE(pilot.near());
+}
+
+TEST(TakeoverTick, ShowsTheResidualWhatTheAimAppliesAndNothingPastThePlane) {
+  const std::vector<rl_policy::Gate> gates = trainedGates();
+  const Course course(gates);
+  const auto main = mainPolicy();
+  Takeover pilot(
+    memoryNetworks(), std::vector<BarKind>{BarKind::UpDown, BarKind::Rotating}, BarSide::Right);
+  pilot.start(kGate07, course.size());
+  for (int i = 0; i < 8; ++i) {
+    pilot.advance(nearGate(gates[kGate07], -1.0), course, kGate07);
+  }
+  ASSERT_EQ(pilot.gain(), 1.0);
+  pilot.act(*main, zeroRow(), nearGate(gates[kGate07], -1.0), course, 1.0);
+  const Eigen::VectorXd & row = pilot.tick().row;
+  ASSERT_EQ(row.size(), 72);
+  EXPECT_FLOAT_EQ(row(69), static_cast<float>(pilot.tick().aim.x()));
+  EXPECT_FLOAT_EQ(row(70), static_cast<float>(pilot.tick().aim.y()));
+  EXPECT_EQ(row(71), 1.0);
+  EXPECT_NE(pilot.tick().aim, Eigen::Vector2d::Zero());
+  pilot.advance(nearGate(gates[kGate07], 0.5), course, kGate07 + 1);
+  pilot.act(*main, zeroRow(), nearGate(gates[kGate07], 0.5), course, 1.01);
+  EXPECT_EQ(pilot.tick().row(69), 0.0);
+  EXPECT_EQ(pilot.tick().row(70), 0.0);
+}
+
+namespace
+{
+
+// Flights of quadlab's env, tick by tick, against what the plugin's Takeover does with them.
+void replayTrace(const std::string & fixture, const std::shared_ptr<const TakeoverNetworks> & files)
+{
+  const YAML::Node trace = rl_policy_test::loadFixture(fixture);
   const double tolerance = trace["tolerance"].as<double>();
   const double delay = trace["delay_s"].as<double>();
   const double dt = trace["dt"].as<double>();
@@ -601,7 +719,7 @@ TEST(TakeoverTrace, IsWhatTheEnvFlew) {
     for (const YAML::Node & kind : flight["kinds"]) {
       kinds.push_back(rl_policy::barKindFromString(kind.as<std::string>()));
     }
-    Takeover pilot(networks(), kinds, BarSide::Right);
+    Takeover pilot(files, kinds, BarSide::Right);
     const YAML::Node ticks = flight["ticks"];
     pilot.start(static_cast<std::size_t>(ticks[0][kTarget].as<double>()), course.size());
     std::size_t index = 0;
@@ -621,7 +739,7 @@ TEST(TakeoverTrace, IsWhatTheEnvFlew) {
       ASSERT_EQ(pilot.obstacle(), static_cast<std::size_t>(tick[kObstacle])) << where;
       ASSERT_NEAR(pilot.gain(), tick[kGain], tolerance) << where;
       if (tick[kReading] != 0.0) {
-        if (networks()->spec().frame_hz > 0.0) {
+        if (files->spec().frame_hz > 0.0) {
           ASSERT_TRUE(pilot.addValues(t - delay, {tick[kValues], tick[kValues + 1]})) << where;
         } else {
           pilot.keepValues(t - delay, {tick[kValues], tick[kValues + 1]});
@@ -668,6 +786,16 @@ TEST(TakeoverTrace, IsWhatTheEnvFlew) {
   EXPECT_GT(window_ticks, 150u);
   EXPECT_GT(aimed_ticks, 100u);
   EXPECT_GT(readings, 15u);
+}
+
+}  // namespace
+
+TEST(TakeoverTrace, IsWhatTheEnvFlew) {
+  replayTrace("takeover_trace.yaml", networks());
+}
+
+TEST(TakeoverTrace, WithARecurrentAimIsWhatTheEnvFlewToo) {
+  replayTrace("takeover_memory_trace.yaml", memoryNetworks());
 }
 
 TEST_F(TakeoverMission, IsRefusedOnAHoverMission) {

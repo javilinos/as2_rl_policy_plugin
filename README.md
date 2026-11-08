@@ -9,7 +9,7 @@ networks on top of its race policy (below).
 
 - `as2_rl_policy_core`: the policy file loader (`quadlab_policy` v1, goldens checked on load),
   the gate-relative observation, the gate sequencer, the action decode, the mission
-  (Idle, Race, Hold) and the takeover (`quadlab_takeover` v1). No ROS.
+  (Idle, Race, Hold) and the takeover (`quadlab_takeover` v1 to v3). No ROS.
 - `as2_rl_policy_lib`: the `ControllerBase` plugin around it.
 
 Every race exit (laps done, a missed gate, no pass within the timeout, out of bounds, a HOVER
@@ -155,7 +155,14 @@ action = clip(main's action + authority * g * residual(row), -1, 1)
 ```
 
 The race policy (main) runs twice in the window, the aim and the residual once each; outside it
-none of them runs. The action history takes what flew. The window opens when the barred gate is
+none of them runs. The action history takes what flew.
+
+From the file's version 3 the aim may keep a memory (`aim.memory`: the row's columns it reads,
+their standardization, a tanh layer, a GRU and a head, quadlab's `MemoryAim`). Such an aim runs on
+every step from the gate before its bar being the target to the end of the hand-back, gain or none,
+so that its memory holds the whole approach, and starts from nothing at the next obstacle. With
+`show_aim: true` the residual's row also holds `g * aim` (zero past the plane) in two columns
+before `g`. A file holding neither is still version 2. The window opens when the barred gate is
 the target, or `open_s` before its plane while the gate before it is, ramps in over `ramp_in_s`,
 and from `handback_m` past the plane ramps out over `ramp_out_s`. The aim stops at the plane; the
 plane is judged on the estimate. All of these numbers are the networks' own, so the file carries
