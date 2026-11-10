@@ -38,7 +38,9 @@ namespace rl_policy
 inline constexpr const char kTakeoverFormat[] = "quadlab_takeover";
 // 2 adds reading.frame_hz: a reader that skips it thins the frames its networks expect whole, so it must refuse the file.
 // 3 adds the recurrent aim (aim.memory) and show_aim, which a reader before it would fly as neither.
-inline constexpr int kTakeoverFormatVersion = 3;
+// 4 adds the aim on a rule (aim.rule), which this reader refuses: its own reader flies it.
+// 5 adds window.handback_next_m, the hand-back past the gate after the bar, which a reader before it would make early.
+inline constexpr int kTakeoverFormatVersion = 5;
 // main's row: the R6 block and two commands.
 inline constexpr int kMainRowSize = 31;
 inline constexpr int kAimSize = 2;
@@ -116,6 +118,9 @@ struct TakeoverSpec
   double ramp_in_s = 0.0;
   double ramp_out_s = 0.0;
   double handback_m = 0.0;
+  // Not negative: the hand-back this far past the plane of the gate after the obstacle's, once that
+  // gate is passed, in place of handback_m. Negative: handback_m.
+  double handback_next_m = -1.0;
   int history = 0;
   double reading_hz = 0.0;
   // Positive: the networks trained on the detector's every frame in the newest slot, the history
@@ -314,6 +319,9 @@ private:
 
   // How far past the obstacle's plane, along its normal.
   double beyond(const VehicleState & state, const Course & course) const;
+
+  // How far past the plane of the gate after the obstacle's, along that gate's normal.
+  double beyondNext(const VehicleState & state, const Course & course) const;
 
   // To the obstacle's plane at the speed along its normal, 1 m/s at least, in [0, time_scale_s].
   double tau(const VehicleState & state, const Course & course) const;

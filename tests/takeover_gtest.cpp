@@ -324,6 +324,28 @@ TEST(TakeoverFile, HoldsARecurrentAimAndShowAimFromItsThirdVersionOn) {
   EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
 }
 
+TEST(TakeoverFile, HoldsAHandBackPastTheNextGateFromItsFifthVersionOn) {
+  EXPECT_LT(networks()->spec().handback_next_m, 0.0);
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  doc["format_version"] = 5;
+  doc["window"]["handback_next_m"] = 1.0;
+  const auto later = TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover"));
+  EXPECT_EQ(later->spec().handback_next_m, 1.0);
+  EXPECT_EQ(later->spec().handback_m, 3.0);
+  doc["window"]["handback_next_m"] = -0.5;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+  doc["window"]["handback_next_m"] = 1.0;
+  doc["format_version"] = 3;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
+TEST(TakeoverFile, IsRefusedWithAnAimOnARule) {
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  doc["format_version"] = 5;
+  doc["aim"]["rule"]["kind"] = "fit";
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
 TEST(TakeoverFile, IsRefusedWhenItsRecurrentAimReadsPastTheRow) {
   YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
   doc["aim"]["memory"]["columns"][0] = 70;
@@ -584,6 +606,35 @@ TEST(TakeoverTick, MovesToTheNextObstacleOnlyWhenTheHandBackIsOver) {
   EXPECT_EQ(pilot->mode(), TakeoverMode::Before);
   EXPECT_EQ(pilot->obstacle(), 1u);
   EXPECT_EQ(pilot->readings().newest(), -std::numeric_limits<double>::infinity());
+}
+
+TEST(TakeoverTick, WithHandbackNextHandsBackPastTheGateAfterTheBar) {
+  YAML::Node doc = rl_policy_test::loadFixture("takeover.yaml");
+  doc["format_version"] = 5;
+  doc["window"]["handback_next_m"] = 1.0;
+  const auto later = TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover"));
+  const std::vector<rl_policy::Gate> gates = trainedGates();
+  const Course course(gates);
+  Takeover pilot(later, std::vector<BarKind>{BarKind::UpDown, BarKind::Rotating}, BarSide::Right);
+  pilot.start(kGate07, course.size());
+  pilot.advance(nearGate(gates[kGate07], -1.0), course, kGate07);
+  EXPECT_EQ(pilot.mode(), TakeoverMode::Active);
+  // Past the bar's handback_m, which no longer hands back.
+  pilot.advance(nearGate(gates[kGate07], 3.1), course, kGate07 + 1);
+  EXPECT_EQ(pilot.mode(), TakeoverMode::Active);
+  pilot.advance(nearGate(gates[kGate07 + 1], -0.5), course, kGate07 + 1);
+  EXPECT_EQ(pilot.mode(), TakeoverMode::Active);
+  // The gate after the bar passed, but not by 1 m.
+  pilot.advance(nearGate(gates[kGate07 + 1], 0.9), course, kGate07 + 2);
+  EXPECT_EQ(pilot.mode(), TakeoverMode::Active);
+  pilot.advance(nearGate(gates[kGate07 + 1], 1.1), course, kGate07 + 2);
+  EXPECT_EQ(pilot.mode(), TakeoverMode::HandingBack);
+  for (int i = 0; i < 11; ++i) {
+    pilot.advance(nearGate(gates[kGate07 + 1], 1.2), course, kGate07 + 2);
+  }
+  EXPECT_EQ(pilot.gain(), 0.0);
+  EXPECT_EQ(pilot.mode(), TakeoverMode::Before);
+  EXPECT_EQ(pilot.obstacle(), 1u);
 }
 
 TEST(TakeoverTick, WithOneBarStandingComesBackToItsGateEveryLap) {

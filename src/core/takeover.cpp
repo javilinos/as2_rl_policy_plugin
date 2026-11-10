@@ -302,6 +302,18 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
     spec.ramp_in_s = positive("ramp_in_s");
     spec.ramp_out_s = positive("ramp_out_s");
     spec.handback_m = positive("handback_m");
+    const YAML::Node next = window["handback_next_m"];
+    if (next.IsDefined() && !next.IsNull()) {
+      if (version < 5) {
+        throw PolicyError(
+                "format_version " + std::to_string(version) +
+                " holds no window.handback_next_m: it came with 5");
+      }
+      spec.handback_next_m = finiteDouble(next, "window.handback_next_m");
+      if (spec.handback_next_m < 0.0) {
+        throw PolicyError("'window.handback_next_m' must not be negative");
+      }
+    }
 
     const YAML::Node reading = required(root, "reading", "");
     spec.history =
@@ -331,6 +343,9 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
       throw PolicyError(
               "format_version " + std::to_string(version) +
               " holds no recurrent aim or show_aim: they came with 3");
+    }
+    if (aim_node.IsMap() && aim_node["rule"].IsDefined() && !aim_node["rule"].IsNull()) {
+      throw PolicyError("an aim on a rule (aim.rule, format 4) is not flown by this reader");
     }
 
     const YAML::Node gates = required(root, "gates", "");
@@ -615,6 +630,14 @@ double Takeover::beyond(const VehicleState & state, const Course & course) const
   return (state.position - gate.position).dot(normal);
 }
 
+double Takeover::beyondNext(const VehicleState & state, const Course & course) const
+{
+  const Gate & gate =
+    course.gate((networks_->spec().gates[obstacle_].index + 1) % course.size());
+  const Eigen::Vector3d normal(std::cos(gate.yaw), std::sin(gate.yaw), 0.0);
+  return (state.position - gate.position).dot(normal);
+}
+
 double Takeover::tau(const VehicleState & state, const Course & course) const
 {
   const Gate & gate = course.gate(networks_->spec().gates[obstacle_].index);
@@ -638,9 +661,10 @@ void Takeover::advance(const VehicleState & state, const Course & course, std::s
     clock_s_ = 0.0;
   }
   const std::size_t past = (target + gates - gate.index) % gates;
-  if (mode_ == TakeoverMode::Active && past >= 1 && past < gates / 2 &&
-    beyond(state, course) > spec.handback_m)
-  {
+  const bool back = spec.handback_next_m < 0.0 ?
+    past >= 1 && beyond(state, course) > spec.handback_m :
+    past >= 2 && beyondNext(state, course) > spec.handback_next_m;
+  if (mode_ == TakeoverMode::Active && past < gates / 2 && back) {
     mode_ = TakeoverMode::HandingBack;
     clock_s_ = 0.0;
     gain_out_ = gain_;

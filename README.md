@@ -164,8 +164,10 @@ so that its memory holds the whole approach, and starts from nothing at the next
 `show_aim: true` the residual's row also holds `g * aim` (zero past the plane) in two columns
 before `g`. A file holding neither is still version 2. The window opens when the barred gate is
 the target, or `open_s` before its plane while the gate before it is, ramps in over `ramp_in_s`,
-and from `handback_m` past the plane ramps out over `ramp_out_s`. The aim stops at the plane; the
-plane is judged on the estimate. All of these numbers are the networks' own, so the file carries
+and from `handback_m` past the plane ramps out over `ramp_out_s`. From the file's version 5,
+`window.handback_next_m` keeps the window open through the gate after the barred one: it ramps out
+from that far past the plane of that next gate, once it is passed, and `handback_m` is not used. The
+aim stops at the plane; the planes are judged on the estimate. All of these numbers are the networks' own, so the file carries
 them, with its barred gates and the sha256 of the race policy's checkpoint: a race policy of any
 other hash, or a course where those gates are others, is refused.
 
