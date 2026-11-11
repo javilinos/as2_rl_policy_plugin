@@ -314,6 +314,18 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
         throw PolicyError("'window.handback_next_m' must not be negative");
       }
     }
+    const YAML::Node hold = window["lane_hold_s"];
+    if (hold.IsDefined() && !hold.IsNull()) {
+      if (version < 6) {
+        throw PolicyError(
+                "format_version " + std::to_string(version) +
+                " holds no window.lane_hold_s: it came with 6");
+      }
+      spec.lane_hold_s = finiteDouble(hold, "window.lane_hold_s");
+      if (spec.lane_hold_s < 0.0) {
+        throw PolicyError("'window.lane_hold_s' must not be negative");
+      }
+    }
 
     const YAML::Node reading = required(root, "reading", "");
     spec.history =
@@ -559,6 +571,24 @@ Takeover::Takeover(
   memory_ = Eigen::VectorXd::Zero(networks_->memorySize());
 }
 
+Eigen::Vector2d LaneHold::hold(const Eigen::Vector2d & aim, bool on, double tau_s, double hold_s)
+{
+  Eigen::Vector2d held = aim;
+  const bool named = held.norm() >= kHoldMin;
+  on_ = on_ && on;
+  if (on && !on_ && named && tau_s <= hold_s) {
+    ref_ = held;
+    on_ = true;
+  }
+  if (on_ && held.dot(ref_) < 0.0) {
+    held = -held;
+  }
+  if (on_ && named) {
+    ref_ = held;
+  }
+  return held;
+}
+
 void Takeover::start(std::size_t target, std::size_t gates)
 {
   obstacle_ = nextObstacle(target, gates);
@@ -587,6 +617,7 @@ void Takeover::open()
   clock_s_ = 0.0;
   readings_.clear();
   memory_.setZero();
+  hold_.clear();
 }
 
 bool Takeover::near() const
@@ -727,6 +758,10 @@ Action Takeover::act(
     }
   } else if (ahead) {
     aim = networks_->aim(input, memory_);
+  }
+  if (spec.lane_hold_s > 0.0) {
+    const bool on = kinds_[obstacle_] == BarKind::Rotating && ahead && mode_ == TakeoverMode::Active;
+    aim = hold_.hold(aim, on, tick_.tau_s, spec.lane_hold_s);
   }
   if (!(gain_ > 0.0)) {
     return tick_.main;

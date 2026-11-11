@@ -339,6 +339,20 @@ TEST(TakeoverFile, HoldsAHandBackPastTheNextGateFromItsFifthVersionOn) {
   EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
 }
 
+TEST(TakeoverFile, HoldsTheRotatingBarsLaneFromItsSixthVersionOn) {
+  EXPECT_EQ(networks()->spec().lane_hold_s, 0.0);
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  doc["format_version"] = 6;
+  doc["window"]["lane_hold_s"] = 0.45;
+  const auto later = TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover"));
+  EXPECT_EQ(later->spec().lane_hold_s, 0.45);
+  doc["window"]["lane_hold_s"] = -0.1;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+  doc["window"]["lane_hold_s"] = 0.45;
+  doc["format_version"] = 5;
+  EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
 TEST(TakeoverFile, IsRefusedWithAnAimOnARule) {
   YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
   doc["format_version"] = 5;
@@ -750,8 +764,11 @@ TEST(TakeoverTick, ShowsTheResidualWhatTheAimAppliesAndNothingPastThePlane) {
 namespace
 {
 
-// Flights of quadlab's env, tick by tick, against what the plugin's Takeover does with them.
-void replayTrace(const std::string & fixture, const std::shared_ptr<const TakeoverNetworks> & files)
+// Flights of quadlab's env, tick by tick, against what the plugin's Takeover does with them; `held`
+// counts the ticks a lane hold held.
+void replayTrace(
+  const std::string & fixture, const std::shared_ptr<const TakeoverNetworks> & files,
+  std::size_t * held = nullptr)
 {
   const YAML::Node trace = rl_policy_test::loadFixture(fixture);
   const double tolerance = trace["tolerance"].as<double>();
@@ -765,6 +782,7 @@ void replayTrace(const std::string & fixture, const std::shared_ptr<const Takeov
   std::size_t window_ticks = 0;
   std::size_t readings = 0;
   std::size_t aimed_ticks = 0;
+  std::size_t held_ticks = 0;
   for (const YAML::Node & flight : trace["flights"]) {
     std::vector<BarKind> kinds;
     for (const YAML::Node & kind : flight["kinds"]) {
@@ -801,6 +819,7 @@ void replayTrace(const std::string & fixture, const std::shared_ptr<const Takeov
       for (int k = 0; k < rl_policy::kActionSize; ++k) {
         ASSERT_NEAR(action[k], tick[kAction + k], tolerance) << where << " action " << k;
       }
+      held_ticks += pilot.laneHold().on() ? 1 : 0;
       modes.insert(static_cast<int>(tick[kMode]));
       obstacles.insert(static_cast<int>(tick[kObstacle]));
       if (!(tick[kGain] > 0.0)) {
@@ -837,6 +856,9 @@ void replayTrace(const std::string & fixture, const std::shared_ptr<const Takeov
   EXPECT_GT(window_ticks, 150u);
   EXPECT_GT(aimed_ticks, 100u);
   EXPECT_GT(readings, 15u);
+  if (held != nullptr) {
+    *held = held_ticks;
+  }
 }
 
 }  // namespace
@@ -846,7 +868,68 @@ TEST(TakeoverTrace, IsWhatTheEnvFlew) {
 }
 
 TEST(TakeoverTrace, WithARecurrentAimIsWhatTheEnvFlewToo) {
-  replayTrace("takeover_memory_trace.yaml", memoryNetworks());
+  std::size_t held = 1;
+  replayTrace("takeover_memory_trace.yaml", memoryNetworks(), &held);
+  EXPECT_EQ(held, 0u);
+}
+
+// The trace's rotating bar is passed without a late flip: held, its aim flies as it says it.
+TEST(TakeoverTrace, WithTheLaneHoldAndNoLateFlipIsWhatTheEnvFlewToo) {
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  doc["format_version"] = 6;
+  doc["window"]["lane_hold_s"] = 0.45;
+  std::size_t held = 0;
+  replayTrace(
+    "takeover_memory_trace.yaml", TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")),
+    &held);
+  EXPECT_GT(held, 20u);
+}
+
+// quadlab's TakeoverVecEnv._hold_lane on made-up approaches, tick by tick.
+TEST(LaneHold, IsWhatTheEnvFlew) {
+  const YAML::Node fixture = rl_policy_test::loadFixture("takeover_hold.yaml");
+  const double hold_s = fixture["hold_s"].as<double>();
+  EXPECT_EQ(fixture["min"].as<double>(), rl_policy::kHoldMin);
+  std::set<std::string> reversing;
+  std::size_t held_ticks = 0;
+  for (const YAML::Node & lane : fixture["lanes"]) {
+    const std::string name = lane["name"].as<std::string>();
+    rl_policy::LaneHold hold;
+    std::size_t index = 0;
+    for (const YAML::Node & node : lane["ticks"]) {
+      const std::vector<double> tick = rl_policy_test::doubles(node);
+      const std::string where = name + " tick " + std::to_string(index++);
+      const Eigen::Vector2d aim(tick[0], tick[1]);
+      const bool on = tick[2] != 0.0 && tick[3] != 0.0 && tick[4] != 0.0;
+      const Eigen::Vector2d held = hold.hold(aim, on, tick[5], hold_s);
+      ASSERT_EQ(held.x(), tick[6]) << where;
+      ASSERT_EQ(held.y(), tick[7]) << where;
+      ASSERT_EQ(hold.on(), tick[8] != 0.0) << where;
+      if (held != aim) {
+        reversing.insert(name);
+      }
+      held_ticks += hold.on() ? 1 : 0;
+    }
+  }
+  EXPECT_EQ(
+    reversing,
+    (std::set<std::string>{"late_flip", "small_aim", "turning_lane", "window_closing", "random"}));
+  EXPECT_GT(held_ticks, 200u);
+}
+
+TEST(LaneHold, KeepsTheLaneItHeldOnAndEndsOffItsBar) {
+  rl_policy::LaneHold hold;
+  const Eigen::Vector2d over(0.0, 0.6);
+  EXPECT_EQ(hold.hold(over, true, 0.5, 0.45), over);
+  EXPECT_FALSE(hold.on());
+  EXPECT_EQ(hold.hold(over, true, 0.45, 0.45), over);
+  EXPECT_TRUE(hold.on());
+  EXPECT_EQ(hold.hold(-over, true, 0.3, 0.45), over);
+  // A small aim names no lane: it flies as held and leaves the reference.
+  EXPECT_EQ(hold.hold(Eigen::Vector2d(0.0, -0.1), true, 0.2, 0.45), Eigen::Vector2d(0.0, 0.1));
+  EXPECT_EQ(hold.hold(-over, true, 0.1, 0.45), over);
+  EXPECT_EQ(hold.hold(-over, false, 0.05, 0.45), -over);
+  EXPECT_FALSE(hold.on());
 }
 
 TEST_F(TakeoverMission, IsRefusedOnAHoverMission) {

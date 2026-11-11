@@ -40,7 +40,8 @@ inline constexpr const char kTakeoverFormat[] = "quadlab_takeover";
 // 3 adds the recurrent aim (aim.memory) and show_aim, which a reader before it would fly as neither.
 // 4 adds the aim on a rule (aim.rule), which this reader refuses: its own reader flies it.
 // 5 adds window.handback_next_m, the hand-back past the gate after the bar, which a reader before it would make early.
-inline constexpr int kTakeoverFormatVersion = 5;
+// 6 adds window.lane_hold_s, the rotating bar's lane kept near its plane, which a reader before it would fly without.
+inline constexpr int kTakeoverFormatVersion = 6;
 // main's row: the R6 block and two commands.
 inline constexpr int kMainRowSize = 31;
 inline constexpr int kAimSize = 2;
@@ -121,6 +122,9 @@ struct TakeoverSpec
   // Not negative: the hand-back this far past the plane of the gate after the obstacle's, once that
   // gate is passed, in place of handback_m. Negative: handback_m.
   double handback_next_m = -1.0;
+  // Positive: at a rotating bar the aim's lane is kept from this long before its plane (LaneHold).
+  // Zero: the aim as it says it.
+  double lane_hold_s = 0.0;
   int history = 0;
   double reading_hz = 0.0;
   // Positive: the networks trained on the detector's every frame in the newest slot, the history
@@ -238,6 +242,29 @@ private:
   std::vector<std::array<double, 2>> values_;
 };
 
+// An aim this long or more names a lane, in its units: quadlab.envs.takeover.HOLD_MIN.
+inline constexpr double kHoldMin = 0.2;
+
+// quadlab.envs.takeover.TakeoverVecEnv._hold_lane: at a rotating bar, in the window and before its
+// plane, from hold_s before the plane, the aim's lane is kept. Its half-plane is the one of the last
+// held aim that named a lane: an aim across it flies reversed, the lane on the other side of the
+// bar's centre, so a late flip of the aim moves nothing; a lane turning with the bar turns the hold.
+class LaneHold
+{
+public:
+  // One tick's aim as flown. `on`: a rotating bar, the window active, before its plane; the hold
+  // ends on the first tick it is not.
+  Eigen::Vector2d hold(const Eigen::Vector2d & aim, bool on, double tau_s, double hold_s);
+
+  void clear() {on_ = false;}
+
+  bool on() const {return on_;}
+
+private:
+  bool on_ = false;
+  Eigen::Vector2d ref_ = Eigen::Vector2d::Zero();
+};
+
 // What one tick did, for the debug topic.
 struct TakeoverTick
 {
@@ -306,6 +333,9 @@ public:
   // recurrent aim remembers.
   bool near() const;
 
+  // With the file's lane_hold_s, the rotating bar's lane is held.
+  const LaneHold & laneHold() const {return hold_;}
+
   // Detector results taken in, of any gate, and how many of them the row has held.
   std::uint64_t readingsSeen() const {return seen_;}
 
@@ -339,6 +369,7 @@ private:
   double gain_ = 0.0;
   double gain_out_ = 0.0;
   Eigen::VectorXd memory_;
+  LaneHold hold_;
   TakeoverTick tick_;
   std::uint64_t seen_ = 0;
   std::uint64_t kept_ = 0;

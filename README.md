@@ -166,7 +166,11 @@ before `g`. A file holding neither is still version 2. The window opens when the
 the target, or `open_s` before its plane while the gate before it is, ramps in over `ramp_in_s`,
 and from `handback_m` past the plane ramps out over `ramp_out_s`. From the file's version 5,
 `window.handback_next_m` keeps the window open through the gate after the barred one: it ramps out
-from that far past the plane of that next gate, once it is passed, and `handback_m` is not used. The
+from that far past the plane of that next gate, once it is passed, and `handback_m` is not used. From
+version 6, `window.lane_hold_s` keeps the aim's lane at a rotating bar: in the window, from that
+long before the plane, an aim across the half-plane of the last held aim that named a lane (0.2 or
+more) flies reversed, the lane on the other side of the bar's centre, so a late flip of the aim moves
+nothing, while a lane turning with the bar turns the hold (quadlab's `TakeoverVecEnv._hold_lane`). The
 aim stops at the plane; the planes are judged on the estimate. All of these numbers are the networks' own, so the file carries
 them, with its barred gates and the sha256 of the race policy's checkpoint: a race policy of any
 other hash, or a course where those gates are others, is refused.
