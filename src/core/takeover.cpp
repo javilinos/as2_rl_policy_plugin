@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "as2_rl_policy/core/angles.hpp"
 #include "as2_rl_policy/core/decode.hpp"
 #include "yaml_fields.hpp"
 
@@ -175,6 +176,56 @@ SlideGeometry parseSlide(const YAML::Node & node, const std::vector<TakeoverGate
     }
   }
   return slide;
+}
+
+// turn: its keys and no others, and every gate it names one of the file's with a rotating bar, once, with
+// its opening and the bar's half width (quadlab.takeover_file._turn).
+TurnGeometry parseTurn(const YAML::Node & node, const std::vector<TakeoverGate> & gates)
+{
+  if (!node.IsMap()) {
+    throw PolicyError("'turn' must be a map");
+  }
+  static const std::vector<std::string> keys = {"window_s", "minimum", "gates"};
+  for (const auto & entry : node) {
+    const std::string key = entry.first.as<std::string>();
+    if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+      throw PolicyError("'turn." + key + "' is not turn's: window_s, minimum, gates");
+    }
+  }
+  TurnGeometry turn;
+  turn.window_s = positiveDouble(required(node, "window_s", "turn"), "turn.window_s");
+  turn.minimum = scalar<int>(required(node, "minimum", "turn"), "turn.minimum", "integer");
+  if (turn.minimum < 2) {
+    throw PolicyError("'turn.minimum' must be at least 2: through fewer there is no line");
+  }
+  turn.gates.resize(gates.size());
+  const YAML::Node listed = required(node, "gates", "turn");
+  if (!listed.IsSequence() || listed.size() == 0) {
+    throw PolicyError("'turn.gates' must be a non-empty sequence");
+  }
+  for (std::size_t i = 0; i < listed.size(); ++i) {
+    const std::string path = "turn.gates[" + std::to_string(i) + "]";
+    const std::string name =
+      scalar<std::string>(required(listed[i], "name", path), path + ".name", "string");
+    const auto found = std::find_if(
+      gates.begin(), gates.end(), [&name](const TakeoverGate & gate) {return gate.name == name;});
+    if (found == gates.end() ||
+      std::find(found->kinds.begin(), found->kinds.end(), BarKind::Rotating) == found->kinds.end())
+    {
+      throw PolicyError(
+              "'" + path + ".name' is '" + name + "', not one of the file's gates with a rotating bar");
+    }
+    TurnGeometry::Gate & gate = turn.gates[static_cast<std::size_t>(found - gates.begin())];
+    if (gate.present) {
+      throw PolicyError("'" + path + "': '" + name + "' is in turn twice");
+    }
+    gate.present = true;
+    gate.opening_half_m =
+      positiveDouble(required(listed[i], "opening_half_m", path), path + ".opening_half_m");
+    gate.half_width_m =
+      positiveDouble(required(listed[i], "half_width_m", path), path + ".half_width_m");
+  }
+  return turn;
 }
 
 TakeoverGate parseGate(const YAML::Node & node, const std::string & path)
@@ -407,6 +458,22 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
     } else if (inset.IsDefined() && !inset.IsNull()) {
       throw PolicyError("'window.slide_inset_m' comes with window.slide_commit_s");
     }
+    const YAML::Node floor = window["turn_floor_inset_m"];
+    if (floor.IsDefined() && !floor.IsNull()) {
+      if (version < 8) {
+        throw PolicyError(
+                "format_version " + std::to_string(version) +
+                " holds no window.turn_floor_inset_m: it came with 8");
+      }
+      if (!(spec.lane_hold_s > 0.0)) {
+        throw PolicyError(
+                "'window.turn_floor_inset_m' deepens the lane window.lane_hold_s holds: it comes with it");
+      }
+      spec.turn_floor_inset_m = finiteDouble(floor, "window.turn_floor_inset_m");
+      if (*spec.turn_floor_inset_m < 0.0) {
+        throw PolicyError("'window.turn_floor_inset_m' must not be negative");
+      }
+    }
 
     const YAML::Node reading = required(root, "reading", "");
     spec.history =
@@ -454,6 +521,13 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
     }
     if (committing) {
       spec.slide = parseSlide(slide, spec.gates);
+    }
+    const YAML::Node turn = root["turn"];
+    if (spec.turn_floor_inset_m.has_value() != (turn.IsDefined() && !turn.IsNull())) {
+      throw PolicyError("window.turn_floor_inset_m and turn come together");
+    }
+    if (spec.turn_floor_inset_m) {
+      spec.turn = parseTurn(turn, spec.gates);
     }
 
     const YAML::Node source = root["source"];
@@ -749,6 +823,72 @@ Eigen::Vector2d SlideCommit::commit(
   return out.cwiseMax(-1.0).cwiseMin(1.0);
 }
 
+Eigen::Vector2d turnFloor(
+  const Eigen::Vector2d & aim, bool on, std::size_t gate, const Eigen::VectorXd & row,
+  const TakeoverSpec & spec)
+{
+  if (!on || !spec.turn || !spec.turn_floor_inset_m || gate >= spec.turn->gates.size() ||
+    !spec.turn->gates[gate].present)
+  {
+    return aim;
+  }
+  const TurnGeometry & turn = *spec.turn;
+  const TurnGeometry::Gate & at = turn.gates[gate];
+  const Eigen::Index first = kMainRowSize + kActionSize;
+  const Eigen::Index end = first + spec.readingEntries();
+  // A line through the angles of the readings of the last window_s (their two values the sine and cosine
+  // of twice the angle, newest first, unwrapped by pi: quadlab.envs.takeover.fit_turn), run on to the
+  // plane; with fewer readings, the newest stands still.
+  double s0 = 0.0;
+  double st = 0.0;
+  double stt = 0.0;
+  double sa = 0.0;
+  double sta = 0.0;
+  double newest = 0.0;
+  double newest_age = 0.0;
+  double previous = 0.0;
+  for (int k = 0; k < spec.history; ++k) {
+    const Eigen::Index slot = first + static_cast<Eigen::Index>(k) * kReadingColumns;
+    double angle = 0.5 * std::atan2(row(slot), row(slot + 1));
+    if (k > 0) {
+      angle -= kPi * std::nearbyint((angle - previous) / kPi);  // numpy's round: half to even
+    }
+    previous = angle;
+    const double age = row(slot + 2) * spec.max_age_s;
+    if (k == 0) {
+      newest = angle;
+      newest_age = age;
+    }
+    if (age < turn.window_s) {
+      const double t = -age;
+      s0 += 1.0;
+      st += t;
+      stt += t * t;
+      sa += angle;
+      sta += t * angle;
+    }
+  }
+  if (!(newest_age < turn.window_s)) {
+    return aim;
+  }
+  const double det = s0 * stt - st * st;
+  const bool lined = s0 >= turn.minimum && det > 1.0e-12;
+  const double rate = lined ? (s0 * sta - st * sa) / det : 0.0;
+  const double now = lined ? (sa - rate * st) / std::max(s0, 1.0) : newest;
+  const double tau = row(end + kBarKinds) * spec.time_scale_s;
+  double angle = std::fmod(now + rate * tau, kPi);
+  if (angle < 0.0) {
+    angle += kPi;
+  }
+  // The guide's lanes lie along the bar's normal
+  const Eigen::Vector2d normal(-std::sin(angle), std::cos(angle));
+  const Eigen::Vector2d held = aim * spec.aim_m;
+  const double across = held.dot(normal);
+  const double middle = 0.5 * (at.half_width_m + at.opening_half_m - *spec.turn_floor_inset_m);
+  const double push = (across >= 0.0 ? 1.0 : -1.0) * std::max(std::abs(across), middle) - across;
+  return ((held + push * normal) / spec.aim_m).cwiseMax(-1.0).cwiseMin(1.0);
+}
+
 void Takeover::start(std::size_t target, std::size_t gates)
 {
   obstacle_ = nextObstacle(target, gates);
@@ -929,6 +1069,11 @@ Action Takeover::act(
     const bool on = (kind == BarKind::UpDown || kind == BarKind::LeftRight) && ahead &&
       mode_ == TakeoverMode::Active;
     aim = slide_.commit(aim, on, kind, obstacle_, input, spec);
+  }
+  if (spec.turn_floor_inset_m) {
+    const bool on = kinds_[obstacle_] == BarKind::Rotating && ahead && mode_ == TakeoverMode::Active &&
+      hold_.on();
+    aim = turnFloor(aim, on, obstacle_, input, spec);
   }
   if (!(gain_ > 0.0)) {
     return tick_.main;

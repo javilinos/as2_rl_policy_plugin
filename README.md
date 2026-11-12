@@ -176,7 +176,13 @@ long before the plane, the side of the bar the aim names is kept, the bar where 
 readings of the last `slide.window_s` (at least `slide.minimum` of them) puts it at the crossing, and
 the aim is at least as deep as the middle of that lane, from the bar's edge to the opening less
 `window.slide_inset_m`, deeper if it says so (quadlab's `TakeoverVecEnv._commit_slide`); `slide.gates`
-holds each barred gate's opening and its sliding bars' run and half width. The
+holds each barred gate's opening and its sliding bars' run and half width. From version 8,
+`window.turn_floor_inset_m` deepens the lane the hold keeps at a rotating bar: once the hold has its
+lane, the aim is at least as deep, across the bar's line where a line through the angle readings of the
+last `turn.window_s` (at least `turn.minimum` of them) puts it at the crossing, as the middle of the
+half-aperture on its side, from the bar's edge to the opening less `window.turn_floor_inset_m`; its part
+along the bar stays as it says (quadlab's `TakeoverVecEnv._floor_turn`). It comes with
+`window.lane_hold_s`, and `turn.gates` holds each rotating bar's gate's opening and the bar's half width. The
 aim stops at the plane; the planes are judged on the estimate. All of these numbers are the networks' own, so the file carries
 them, with its barred gates and the sha256 of the race policy's checkpoint: a race policy of any
 other hash, or a course where those gates are others, is refused.

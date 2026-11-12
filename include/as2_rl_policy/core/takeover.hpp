@@ -43,7 +43,9 @@ inline constexpr const char kTakeoverFormat[] = "quadlab_takeover";
 // 6 adds window.lane_hold_s, the rotating bar's lane kept near its plane, which a reader before it would fly without.
 // 7 adds window.slide_commit_s and slide_inset_m with the sliding bars' slide block, a sliding bar's lane committed near
 // its plane, which a reader before it would fly without.
-inline constexpr int kTakeoverFormatVersion = 7;
+// 8 adds window.turn_floor_inset_m with the rotating bars' turn block, the rotating bar's held lane at least as deep as
+// its middle, which a reader before it would fly without.
+inline constexpr int kTakeoverFormatVersion = 8;
 // main's row: the R6 block and two commands.
 inline constexpr int kMainRowSize = 31;
 inline constexpr int kAimSize = 2;
@@ -131,6 +133,22 @@ struct SlideGeometry
   std::vector<Gate> gates;
 };
 
+// Where a floor at the rotating bars draws its lanes (format 8's turn): a line through the angle readings of
+// the last window_s, `minimum` of them at least, and each barred gate's opening and its rotating bar's half
+// width, by the file's gates.
+struct TurnGeometry
+{
+  struct Gate
+  {
+    bool present = false;
+    double opening_half_m = 0.0;
+    double half_width_m = 0.0;
+  };
+  double window_s = 0.0;
+  int minimum = 0;
+  std::vector<Gate> gates;
+};
+
 // What a takeover file says defines its networks.
 struct TakeoverSpec
 {
@@ -156,6 +174,12 @@ struct TakeoverSpec
   double slide_inset_m = 0.0;
   // With slide_commit_s, where the commit's lanes are.
   std::optional<SlideGeometry> slide;
+  // Set: at a rotating bar, once the lane hold holds its lane, the aim at least as deep as the middle of the
+  // half-aperture on its side of the bar's line at the crossing, from the bar's edge to the opening less
+  // this (turnFloor). Unset: the held aim as it is.
+  std::optional<double> turn_floor_inset_m;
+  // With turn_floor_inset_m, where the floor's lanes are.
+  std::optional<TurnGeometry> turn;
   int history = 0;
   double reading_hz = 0.0;
   // Positive: the networks trained on the detector's every frame in the newest slot, the history
@@ -322,6 +346,16 @@ private:
   bool on_ = false;
   double side_ = 0.0;
 };
+
+// quadlab.envs.takeover.TakeoverVecEnv._floor_turn: at a rotating bar, once the lane hold holds its lane,
+// the aim at least as deep as the middle of the half-aperture on its side of the bar's line, from the bar's
+// edge to the opening less turn_floor_inset_m, the line where one through the row's angle readings puts the
+// bar at the crossing; the aim's part along the bar as it says. As at a sliding bar, a lane near the bar
+// hedges between two alike lanes. `on`: the hold on, the window active, before the plane, at the file's
+// `gate`. Stateless: the hold keeps the side.
+Eigen::Vector2d turnFloor(
+  const Eigen::Vector2d & aim, bool on, std::size_t gate, const Eigen::VectorXd & row,
+  const TakeoverSpec & spec);
 
 // What one tick did, for the debug topic.
 struct TakeoverTick

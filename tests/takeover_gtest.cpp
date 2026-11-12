@@ -397,6 +397,47 @@ TEST(TakeoverFile, CommitsTheSlidingBarsLaneFromItsSeventhVersionOn) {
   refused([](YAML::Node & d) {d["slide"]["speed"] = 1.0;});
 }
 
+TEST(TakeoverFile, FloorsTheRotatingBarsLaneFromItsEighthVersionOn) {
+  EXPECT_FALSE(networks()->spec().turn_floor_inset_m);
+  EXPECT_FALSE(networks()->spec().turn);
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  doc["format_version"] = 8;
+  doc["window"]["lane_hold_s"] = 0.45;
+  doc["window"]["turn_floor_inset_m"] = 0.15;
+  YAML::Node gate;
+  gate["name"] = doc["gates"][1]["name"].as<std::string>();  // gate12_oct, the rotating bar's
+  gate["opening_half_m"] = 0.985;
+  gate["half_width_m"] = 0.075;
+  doc["turn"]["window_s"] = 0.45;
+  doc["turn"]["minimum"] = 3;
+  doc["turn"]["gates"].push_back(gate);
+  const auto later = TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover"));
+  ASSERT_TRUE(later->spec().turn_floor_inset_m);
+  EXPECT_EQ(*later->spec().turn_floor_inset_m, 0.15);
+  ASSERT_TRUE(later->spec().turn);
+  EXPECT_EQ(later->spec().turn->window_s, 0.45);
+  EXPECT_EQ(later->spec().turn->minimum, 3);
+  ASSERT_EQ(later->spec().turn->gates.size(), later->spec().gates.size());
+  EXPECT_FALSE(later->spec().turn->gates[0].present);
+  ASSERT_TRUE(later->spec().turn->gates[1].present);
+  EXPECT_EQ(later->spec().turn->gates[1].opening_half_m, 0.985);
+  EXPECT_EQ(later->spec().turn->gates[1].half_width_m, 0.075);
+  const auto refused = [&doc](const std::function<void(YAML::Node &)> & change) {
+      YAML::Node copy = YAML::Clone(doc);
+      change(copy);
+      EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(copy, "takeover")), PolicyError);
+    };
+  refused([](YAML::Node & d) {d["format_version"] = 7;});
+  refused([](YAML::Node & d) {d["window"]["turn_floor_inset_m"] = -0.1;});
+  refused([](YAML::Node & d) {d["window"].remove("lane_hold_s");});
+  refused([](YAML::Node & d) {d.remove("turn");});
+  refused([](YAML::Node & d) {d["window"].remove("turn_floor_inset_m");});
+  refused([](YAML::Node & d) {d["turn"]["minimum"] = 1;});
+  refused([](YAML::Node & d) {d["turn"]["gates"][0]["name"] = d["gates"][0]["name"].as<std::string>();});
+  refused([](YAML::Node & d) {d["turn"]["gates"][0]["half_width_m"] = 0.0;});
+  refused([](YAML::Node & d) {d["turn"]["speed"] = 1.0;});
+}
+
 TEST(TakeoverFile, IsRefusedWithAnAimOnARule) {
   YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
   doc["format_version"] = 5;
@@ -1023,6 +1064,68 @@ TEST(SlideCommit, IsWhatTheEnvFlew) {
     (std::set<std::string>{"central_late_flip", "deeper_than_its_lane", "up_down", "window_closing",
       "few_readings", "turning_at_its_end", "random"}));
   EXPECT_GT(committed_ticks, 200u);
+}
+
+TEST(TurnFloor, IsWhatTheEnvFlew) {
+  const YAML::Node fixture = rl_policy_test::loadFixture("takeover_turn.yaml");
+  EXPECT_EQ(fixture["min"].as<double>(), rl_policy::kHoldMin);
+  rl_policy::TakeoverSpec spec;
+  spec.aim_m = fixture["aim_m"].as<double>();
+  spec.history = fixture["history"].as<int>();
+  spec.max_age_s = fixture["max_age_s"].as<double>();
+  spec.time_scale_s = 2.0;
+  spec.lane_hold_s = fixture["hold_s"].as<double>();
+  spec.turn_floor_inset_m = fixture["inset_m"].as<double>();
+  rl_policy::TurnGeometry turn;
+  turn.window_s = 0.45;
+  turn.minimum = 3;
+  rl_policy::TurnGeometry::Gate gate;
+  gate.present = true;
+  gate.opening_half_m = fixture["opening_half_m"].as<double>();
+  gate.half_width_m = fixture["half_width_m"].as<double>();
+  turn.gates = {gate};
+  spec.turn = turn;
+  const Eigen::Index first = rl_policy::kMainRowSize + rl_policy::kActionSize;
+  const Eigen::Index end = first + spec.readingEntries();
+  const std::size_t history = static_cast<std::size_t>(spec.history);
+  const std::size_t done = 6 + 3 * history;
+  std::set<std::string> changing;
+  std::size_t floored_ticks = 0;
+  for (const YAML::Node & lane : fixture["lanes"]) {
+    const std::string name = lane["name"].as<std::string>();
+    rl_policy::LaneHold hold;
+    std::size_t index = 0;
+    for (const YAML::Node & node : lane["ticks"]) {
+      const std::vector<double> tick = rl_policy_test::doubles(node);
+      const std::string where = name + " tick " + std::to_string(index++);
+      Eigen::VectorXd row = Eigen::VectorXd::Zero(spec.width());
+      for (std::size_t k = 0; k < history; ++k) {
+        const Eigen::Index slot = first + rl_policy::kReadingColumns * static_cast<Eigen::Index>(k);
+        row(slot) = tick[6 + k];
+        row(slot + 1) = tick[6 + history + k];
+        row(slot + 2) = tick[6 + 2 * history + k];
+      }
+      row(end + static_cast<Eigen::Index>(tick[2])) = 1.0;
+      row(end + rl_policy::kBarKinds) = tick[5];
+      const bool on = tick[2] == 2.0 && tick[3] != 0.0 && tick[4] != 0.0;
+      const Eigen::Vector2d aim(tick[0], tick[1]);
+      const Eigen::Vector2d held = hold.hold(aim, on, tick[5] * spec.time_scale_s, spec.lane_hold_s);
+      const Eigen::Vector2d out = rl_policy::turnFloor(held, on && hold.on(), 0, row, spec);
+      ASSERT_NEAR(out.x(), tick[done], 1e-6) << where;
+      ASSERT_NEAR(out.y(), tick[done + 1], 1e-6) << where;
+      ASSERT_EQ(hold.on(), tick[done + 2] != 0.0) << where;
+      if ((out - aim).norm() > 1e-9) {
+        changing.insert(name);
+      }
+      floored_ticks += (out - held).norm() > 1e-9 ? 1 : 0;
+    }
+  }
+  // Not a deep aim, nor a sliding bar
+  EXPECT_EQ(
+    changing,
+    (std::set<std::string>{"shallow_lane", "late_flip", "fast_past_180", "few_readings",
+      "window_closing", "random"}));
+  EXPECT_GT(floored_ticks, 150u);
 }
 
 TEST(LaneHold, KeepsTheLaneItHeldOnAndEndsOffItsBar) {
