@@ -41,7 +41,9 @@ inline constexpr const char kTakeoverFormat[] = "quadlab_takeover";
 // 4 adds the aim on a rule (aim.rule), which this reader refuses: its own reader flies it.
 // 5 adds window.handback_next_m, the hand-back past the gate after the bar, which a reader before it would make early.
 // 6 adds window.lane_hold_s, the rotating bar's lane kept near its plane, which a reader before it would fly without.
-inline constexpr int kTakeoverFormatVersion = 6;
+// 7 adds window.slide_commit_s and slide_inset_m with the sliding bars' slide block, a sliding bar's lane committed near
+// its plane, which a reader before it would fly without.
+inline constexpr int kTakeoverFormatVersion = 7;
 // main's row: the R6 block and two commands.
 inline constexpr int kMainRowSize = 31;
 inline constexpr int kAimSize = 2;
@@ -107,6 +109,28 @@ struct TakeoverGate
   std::vector<BarKind> kinds;
 };
 
+// Where a commit at the sliding bars draws its lanes (format 7's slide): a line through the readings of
+// the last window_s, `minimum` of them at least, and each barred gate's opening and sliding bars, by
+// the file's gates.
+struct SlideGeometry
+{
+  struct Bar
+  {
+    double travel_m = 0.0;
+    double half_width_m = 0.0;
+  };
+  struct Gate
+  {
+    bool present = false;
+    double opening_half_m = 0.0;
+    // An up-down bar's, a left-right bar's.
+    std::array<std::optional<Bar>, 2> bars;
+  };
+  double window_s = 0.0;
+  int minimum = 0;
+  std::vector<Gate> gates;
+};
+
 // What a takeover file says defines its networks.
 struct TakeoverSpec
 {
@@ -125,6 +149,13 @@ struct TakeoverSpec
   // Positive: at a rotating bar the aim's lane is kept from this long before its plane (LaneHold).
   // Zero: the aim as it says it.
   double lane_hold_s = 0.0;
+  // Positive: at a sliding bar the side of the bar the aim names is kept from this long before its
+  // plane, at least as deep as that lane's middle (SlideCommit). Zero: the aim as it says it.
+  double slide_commit_s = 0.0;
+  // The commit's lane runs from the bar's edge to the opening less this.
+  double slide_inset_m = 0.0;
+  // With slide_commit_s, where the commit's lanes are.
+  std::optional<SlideGeometry> slide;
   int history = 0;
   double reading_hz = 0.0;
   // Positive: the networks trained on the detector's every frame in the newest slot, the history
@@ -265,6 +296,33 @@ private:
   Eigen::Vector2d ref_ = Eigen::Vector2d::Zero();
 };
 
+// quadlab.envs.takeover.TakeoverVecEnv._commit_slide: at a sliding bar, in the window and before its
+// plane, from slide_commit_s before the plane, the side of the bar the aim names then is kept, at least
+// as deep as the middle of that lane: from the bar's edge to the opening less slide_inset_m, the bar
+// where a line through the row's readings puts it at the crossing, deeper if the aim says so. A
+// near-central bar leaves two lanes alike, and the aim hedges between them: shallow, and late back
+// over the bar.
+class SlideCommit
+{
+public:
+  // One tick's aim as flown, `row` the aim's as trained. `on`: a sliding bar of `kind` at the file's
+  // `gate`, the window active, before its plane; the commit ends on the first tick it is not.
+  Eigen::Vector2d commit(
+    const Eigen::Vector2d & aim, bool on, BarKind kind, std::size_t gate, const Eigen::VectorXd & row,
+    const TakeoverSpec & spec);
+
+  void clear() {on_ = false;}
+
+  bool on() const {return on_;}
+
+  // The kept side, +1 or -1 along the bar's run (a left-right bar's along the gate's right).
+  double side() const {return side_;}
+
+private:
+  bool on_ = false;
+  double side_ = 0.0;
+};
+
 // What one tick did, for the debug topic.
 struct TakeoverTick
 {
@@ -336,6 +394,9 @@ public:
   // With the file's lane_hold_s, the rotating bar's lane is held.
   const LaneHold & laneHold() const {return hold_;}
 
+  // With the file's slide_commit_s, a sliding bar's lane is committed.
+  const SlideCommit & slideCommit() const {return slide_;}
+
   // Detector results taken in, of any gate, and how many of them the row has held.
   std::uint64_t readingsSeen() const {return seen_;}
 
@@ -370,6 +431,7 @@ private:
   double gain_out_ = 0.0;
   Eigen::VectorXd memory_;
   LaneHold hold_;
+  SlideCommit slide_;
   TakeoverTick tick_;
   std::uint64_t seen_ = 0;
   std::uint64_t kept_ = 0;

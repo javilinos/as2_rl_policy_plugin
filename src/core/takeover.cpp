@@ -115,6 +115,68 @@ MemoryAim parseMemoryAim(const YAML::Node & aim, Eigen::Index width)
   return out;
 }
 
+// slide: its keys and no others, and every gate it names one of the file's, once, with its opening and
+// sliding bars (quadlab.takeover_file._slide).
+SlideGeometry parseSlide(const YAML::Node & node, const std::vector<TakeoverGate> & gates)
+{
+  if (!node.IsMap()) {
+    throw PolicyError("'slide' must be a map");
+  }
+  static const std::vector<std::string> keys = {"window_s", "minimum", "gates"};
+  for (const auto & entry : node) {
+    const std::string key = entry.first.as<std::string>();
+    if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+      throw PolicyError("'slide." + key + "' is not slide's: window_s, minimum, gates");
+    }
+  }
+  SlideGeometry slide;
+  slide.window_s = positiveDouble(required(node, "window_s", "slide"), "slide.window_s");
+  slide.minimum = scalar<int>(required(node, "minimum", "slide"), "slide.minimum", "integer");
+  if (slide.minimum < 2) {
+    throw PolicyError("'slide.minimum' must be at least 2: through fewer there is no line");
+  }
+  slide.gates.resize(gates.size());
+  const YAML::Node listed = required(node, "gates", "slide");
+  if (!listed.IsSequence() || listed.size() == 0) {
+    throw PolicyError("'slide.gates' must be a non-empty sequence");
+  }
+  for (std::size_t i = 0; i < listed.size(); ++i) {
+    const std::string path = "slide.gates[" + std::to_string(i) + "]";
+    const std::string name =
+      scalar<std::string>(required(listed[i], "name", path), path + ".name", "string");
+    const auto found = std::find_if(
+      gates.begin(), gates.end(), [&name](const TakeoverGate & gate) {return gate.name == name;});
+    if (found == gates.end()) {
+      throw PolicyError("'" + path + ".name' is '" + name + "', not one of the file's gates");
+    }
+    SlideGeometry::Gate & gate = slide.gates[static_cast<std::size_t>(found - gates.begin())];
+    if (gate.present) {
+      throw PolicyError("'" + path + "': '" + name + "' is in slide twice");
+    }
+    gate.present = true;
+    gate.opening_half_m =
+      positiveDouble(required(listed[i], "opening_half_m", path), path + ".opening_half_m");
+    const YAML::Node bars = required(listed[i], "bars", path);
+    if (!bars.IsMap() || bars.size() == 0) {
+      throw PolicyError("'" + path + ".bars' must be a map of the gate's sliding bars");
+    }
+    for (const auto & entry : bars) {
+      const std::string kind = entry.first.as<std::string>();
+      const std::string bar_path = path + ".bars." + kind;
+      if (kind != "vertical" && kind != "horizontal") {
+        throw PolicyError("'" + bar_path + "': slide's bars are vertical or horizontal, sliding");
+      }
+      SlideGeometry::Bar bar;
+      bar.travel_m =
+        positiveDouble(required(entry.second, "travel_m", bar_path), bar_path + ".travel_m");
+      bar.half_width_m =
+        positiveDouble(required(entry.second, "half_width_m", bar_path), bar_path + ".half_width_m");
+      gate.bars[kind == "vertical" ? 0 : 1] = bar;
+    }
+  }
+  return slide;
+}
+
 TakeoverGate parseGate(const YAML::Node & node, const std::string & path)
 {
   TakeoverGate gate;
@@ -326,6 +388,25 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
         throw PolicyError("'window.lane_hold_s' must not be negative");
       }
     }
+    const YAML::Node commit = window["slide_commit_s"];
+    const YAML::Node inset = window["slide_inset_m"];
+    const bool committing = commit.IsDefined() && !commit.IsNull();
+    if (committing) {
+      if (version < 7) {
+        throw PolicyError(
+                "format_version " + std::to_string(version) +
+                " holds no window.slide_commit_s: it came with 7");
+      }
+      spec.slide_commit_s = finiteDouble(commit, "window.slide_commit_s");
+      if (spec.slide_commit_s < 0.0) {
+        throw PolicyError("'window.slide_commit_s' must not be negative");
+      }
+      if (inset.IsDefined() && !inset.IsNull()) {
+        spec.slide_inset_m = finiteDouble(inset, "window.slide_inset_m");
+      }
+    } else if (inset.IsDefined() && !inset.IsNull()) {
+      throw PolicyError("'window.slide_inset_m' comes with window.slide_commit_s");
+    }
 
     const YAML::Node reading = required(root, "reading", "");
     spec.history =
@@ -366,6 +447,13 @@ std::shared_ptr<const TakeoverNetworks> TakeoverNetworks::load(const std::string
     }
     for (std::size_t i = 0; i < gates.size(); ++i) {
       spec.gates.push_back(parseGate(gates[i], "gates[" + std::to_string(i) + "]"));
+    }
+    const YAML::Node slide = root["slide"];
+    if (committing != (slide.IsDefined() && !slide.IsNull())) {
+      throw PolicyError("window.slide_commit_s and slide come together");
+    }
+    if (committing) {
+      spec.slide = parseSlide(slide, spec.gates);
     }
 
     const YAML::Node source = root["source"];
@@ -589,6 +677,78 @@ Eigen::Vector2d LaneHold::hold(const Eigen::Vector2d & aim, bool on, double tau_
   return held;
 }
 
+Eigen::Vector2d SlideCommit::commit(
+  const Eigen::Vector2d & aim, bool on, BarKind kind, std::size_t gate, const Eigen::VectorXd & row,
+  const TakeoverSpec & spec)
+{
+  on_ = on_ && on;
+  if (!on || !spec.slide || gate >= spec.slide->gates.size() ||
+    (kind != BarKind::UpDown && kind != BarKind::LeftRight) ||
+    !spec.slide->gates[gate].bars[static_cast<std::size_t>(kind)])
+  {
+    return aim;
+  }
+  const SlideGeometry & slide = *spec.slide;
+  const SlideGeometry::Gate & at = slide.gates[gate];
+  const SlideGeometry::Bar & bar = *at.bars[static_cast<std::size_t>(kind)];
+  const double travel = bar.travel_m;
+  const Eigen::Index first = kMainRowSize + kActionSize;
+  const Eigen::Index end = first + spec.readingEntries();
+  // A line through the readings of the last window_s, the place against the time with the newest at
+  // 0 (quadlab.envs.takeover.fit_crossing), run on to the plane and turning at the run's ends; with
+  // fewer readings, the newest stands.
+  double s0 = 0.0;
+  double st = 0.0;
+  double stt = 0.0;
+  double sp = 0.0;
+  double stp = 0.0;
+  for (int k = 0; k < spec.history; ++k) {
+    const Eigen::Index slot = first + static_cast<Eigen::Index>(k) * kReadingColumns;
+    const double age = row(slot + 2) * spec.max_age_s;
+    if (age < slide.window_s) {
+      const double t = -age;
+      const double place = row(slot) * travel;
+      s0 += 1.0;
+      st += t;
+      stt += t * t;
+      sp += place;
+      stp += t * place;
+    }
+  }
+  const double det = s0 * stt - st * st;
+  const bool lined = s0 >= slide.minimum && det > 1.0e-12;
+  const double speed = lined ? (s0 * stp - st * sp) / det : 0.0;
+  const double now =
+    std::clamp(lined ? (sp - speed * st) / std::max(s0, 1.0) : row(first) * travel, -travel, travel);
+  const double tau = row(end + kBarKinds) * spec.time_scale_s;
+  const bool read = row(first + 2) * spec.max_age_s < spec.max_age_s;
+  double wrapped = std::fmod(
+    (speed >= 0.0 ? now + travel : 3.0 * travel - now) + std::abs(speed) * tau, 4.0 * travel);
+  if (wrapped < 0.0) {
+    wrapped += 4.0 * travel;
+  }
+  const double place = travel - std::abs(wrapped - 2.0 * travel);
+  // The aim in metres along the run: a left-right bar's along the gate's right.
+  const double along = (kind == BarKind::LeftRight ? -aim.x() : aim.y()) * spec.aim_m;
+  if (!on_ && read && tau <= spec.slide_commit_s) {
+    side_ = std::abs(along - place) > 1.0e-9 ? (along > place ? 1.0 : -1.0) : (place > 0.0 ? -1.0 : 1.0);
+    on_ = true;
+  }
+  if (!on_) {
+    return aim;
+  }
+  const double middle =
+    0.5 * (place + side_ * (bar.half_width_m + at.opening_half_m - spec.slide_inset_m));
+  const double kept = side_ * std::max(side_ * along, side_ * middle) / spec.aim_m;
+  Eigen::Vector2d out = aim;
+  if (kind == BarKind::LeftRight) {
+    out.x() = -kept;
+  } else {
+    out.y() = kept;
+  }
+  return out.cwiseMax(-1.0).cwiseMin(1.0);
+}
+
 void Takeover::start(std::size_t target, std::size_t gates)
 {
   obstacle_ = nextObstacle(target, gates);
@@ -618,6 +778,7 @@ void Takeover::open()
   readings_.clear();
   memory_.setZero();
   hold_.clear();
+  slide_.clear();
 }
 
 bool Takeover::near() const
@@ -762,6 +923,12 @@ Action Takeover::act(
   if (spec.lane_hold_s > 0.0) {
     const bool on = kinds_[obstacle_] == BarKind::Rotating && ahead && mode_ == TakeoverMode::Active;
     aim = hold_.hold(aim, on, tick_.tau_s, spec.lane_hold_s);
+  }
+  if (spec.slide_commit_s > 0.0) {
+    const BarKind kind = kinds_[obstacle_];
+    const bool on = (kind == BarKind::UpDown || kind == BarKind::LeftRight) && ahead &&
+      mode_ == TakeoverMode::Active;
+    aim = slide_.commit(aim, on, kind, obstacle_, input, spec);
   }
   if (!(gain_ > 0.0)) {
     return tick_.main;

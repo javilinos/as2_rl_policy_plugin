@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <functional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -351,6 +352,49 @@ TEST(TakeoverFile, HoldsTheRotatingBarsLaneFromItsSixthVersionOn) {
   doc["window"]["lane_hold_s"] = 0.45;
   doc["format_version"] = 5;
   EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover")), PolicyError);
+}
+
+TEST(TakeoverFile, CommitsTheSlidingBarsLaneFromItsSeventhVersionOn) {
+  EXPECT_EQ(networks()->spec().slide_commit_s, 0.0);
+  EXPECT_FALSE(networks()->spec().slide);
+  YAML::Node doc = rl_policy_test::loadFixture("takeover_memory.yaml");
+  doc["format_version"] = 7;
+  doc["window"]["slide_commit_s"] = 0.45;
+  doc["window"]["slide_inset_m"] = 0.15;
+  YAML::Node gate;
+  gate["name"] = doc["gates"][0]["name"].as<std::string>();
+  gate["opening_half_m"] = 0.81;
+  gate["bars"]["horizontal"]["travel_m"] = 0.66;
+  gate["bars"]["horizontal"]["half_width_m"] = 0.15;
+  doc["slide"]["window_s"] = 0.45;
+  doc["slide"]["minimum"] = 3;
+  doc["slide"]["gates"].push_back(gate);
+  const auto later = TakeoverNetworks::load(rl_policy_test::writeYaml(doc, "takeover"));
+  EXPECT_EQ(later->spec().slide_commit_s, 0.45);
+  EXPECT_EQ(later->spec().slide_inset_m, 0.15);
+  ASSERT_TRUE(later->spec().slide);
+  EXPECT_EQ(later->spec().slide->window_s, 0.45);
+  EXPECT_EQ(later->spec().slide->minimum, 3);
+  ASSERT_EQ(later->spec().slide->gates.size(), later->spec().gates.size());
+  EXPECT_TRUE(later->spec().slide->gates[0].present);
+  EXPECT_FALSE(later->spec().slide->gates[1].present);
+  EXPECT_FALSE(later->spec().slide->gates[0].bars[0]);
+  ASSERT_TRUE(later->spec().slide->gates[0].bars[1]);
+  EXPECT_EQ(later->spec().slide->gates[0].bars[1]->travel_m, 0.66);
+  EXPECT_EQ(later->spec().slide->gates[0].bars[1]->half_width_m, 0.15);
+  const auto refused = [&doc](const std::function<void(YAML::Node &)> & change) {
+      YAML::Node copy = YAML::Clone(doc);
+      change(copy);
+      EXPECT_THROW(TakeoverNetworks::load(rl_policy_test::writeYaml(copy, "takeover")), PolicyError);
+    };
+  refused([](YAML::Node & d) {d["format_version"] = 6;});
+  refused([](YAML::Node & d) {d["window"]["slide_commit_s"] = -0.1;});
+  refused([](YAML::Node & d) {d.remove("slide");});
+  refused([](YAML::Node & d) {d["window"].remove("slide_commit_s");});
+  refused([](YAML::Node & d) {d["slide"]["minimum"] = 1;});
+  refused([](YAML::Node & d) {d["slide"]["gates"][0]["name"] = "gate99";});
+  refused([](YAML::Node & d) {d["slide"]["gates"][0]["bars"]["rotating"]["travel_m"] = 0.5;});
+  refused([](YAML::Node & d) {d["slide"]["speed"] = 1.0;});
 }
 
 TEST(TakeoverFile, IsRefusedWithAnAimOnARule) {
@@ -915,6 +959,70 @@ TEST(LaneHold, IsWhatTheEnvFlew) {
     reversing,
     (std::set<std::string>{"late_flip", "small_aim", "turning_lane", "window_closing", "random"}));
   EXPECT_GT(held_ticks, 200u);
+}
+
+TEST(SlideCommit, IsWhatTheEnvFlew) {
+  const YAML::Node fixture = rl_policy_test::loadFixture("takeover_slide.yaml");
+  rl_policy::TakeoverSpec spec;
+  spec.aim_m = fixture["aim_m"].as<double>();
+  spec.history = fixture["history"].as<int>();
+  spec.max_age_s = fixture["max_age_s"].as<double>();
+  spec.time_scale_s = 2.0;
+  spec.slide_commit_s = fixture["slide_s"].as<double>();
+  spec.slide_inset_m = fixture["inset_m"].as<double>();
+  rl_policy::SlideGeometry slide;
+  slide.window_s = 0.45;
+  slide.minimum = 3;
+  rl_policy::SlideGeometry::Gate gate;
+  gate.present = true;
+  gate.opening_half_m = fixture["opening_half_m"].as<double>();
+  rl_policy::SlideGeometry::Bar bar;
+  bar.travel_m = fixture["travel_m"].as<double>();
+  bar.half_width_m = fixture["half_width_m"].as<double>();
+  gate.bars = {bar, bar};
+  slide.gates = {gate};
+  spec.slide = slide;
+  const Eigen::Index first = rl_policy::kMainRowSize + rl_policy::kActionSize;
+  const Eigen::Index end = first + spec.readingEntries();
+  const std::size_t done = 6 + 2 * static_cast<std::size_t>(spec.history);
+  std::set<std::string> changing;
+  std::size_t committed_ticks = 0;
+  for (const YAML::Node & lane : fixture["lanes"]) {
+    const std::string name = lane["name"].as<std::string>();
+    rl_policy::SlideCommit commit;
+    std::size_t index = 0;
+    for (const YAML::Node & node : lane["ticks"]) {
+      const std::vector<double> tick = rl_policy_test::doubles(node);
+      const std::string where = name + " tick " + std::to_string(index++);
+      const auto kind = static_cast<rl_policy::BarKind>(static_cast<int>(tick[2]));
+      Eigen::VectorXd row = Eigen::VectorXd::Zero(spec.width());
+      for (int k = 0; k < spec.history; ++k) {
+        row(first + rl_policy::kReadingColumns * k) = tick[6 + static_cast<std::size_t>(k)];
+        row(first + rl_policy::kReadingColumns * k + 2) =
+          tick[6 + static_cast<std::size_t>(spec.history + k)];
+      }
+      row(end + static_cast<Eigen::Index>(kind)) = 1.0;
+      row(end + rl_policy::kBarKinds) = tick[5];
+      const bool on = kind != rl_policy::BarKind::Rotating && tick[3] != 0.0 && tick[4] != 0.0;
+      const Eigen::Vector2d aim(tick[0], tick[1]);
+      const Eigen::Vector2d out = commit.commit(aim, on, kind, 0, row, spec);
+      ASSERT_NEAR(out.x(), tick[done], 1e-6) << where;
+      ASSERT_NEAR(out.y(), tick[done + 1], 1e-6) << where;
+      ASSERT_EQ(commit.on(), tick[done + 2] != 0.0) << where;
+      if (commit.on()) {
+        ASSERT_EQ(commit.side(), tick[done + 3]) << where;
+      }
+      if ((out - aim).norm() > 1e-9) {
+        changing.insert(name);
+      }
+      committed_ticks += commit.on() ? 1 : 0;
+    }
+  }
+  EXPECT_EQ(
+    changing,
+    (std::set<std::string>{"central_late_flip", "deeper_than_its_lane", "up_down", "window_closing",
+      "few_readings", "turning_at_its_end", "random"}));
+  EXPECT_GT(committed_ticks, 200u);
 }
 
 TEST(LaneHold, KeepsTheLaneItHeldOnAndEndsOffItsBar) {

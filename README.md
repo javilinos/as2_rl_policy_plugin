@@ -170,7 +170,13 @@ from that far past the plane of that next gate, once it is passed, and `handback
 version 6, `window.lane_hold_s` keeps the aim's lane at a rotating bar: in the window, from that
 long before the plane, an aim across the half-plane of the last held aim that named a lane (0.2 or
 more) flies reversed, the lane on the other side of the bar's centre, so a late flip of the aim moves
-nothing, while a lane turning with the bar turns the hold (quadlab's `TakeoverVecEnv._hold_lane`). The
+nothing, while a lane turning with the bar turns the hold (quadlab's `TakeoverVecEnv._hold_lane`). From
+version 7, `window.slide_commit_s` commits the aim's lane at a sliding bar: in the window, from that
+long before the plane, the side of the bar the aim names is kept, the bar where a line through the
+readings of the last `slide.window_s` (at least `slide.minimum` of them) puts it at the crossing, and
+the aim is at least as deep as the middle of that lane, from the bar's edge to the opening less
+`window.slide_inset_m`, deeper if it says so (quadlab's `TakeoverVecEnv._commit_slide`); `slide.gates`
+holds each barred gate's opening and its sliding bars' run and half width. The
 aim stops at the plane; the planes are judged on the estimate. All of these numbers are the networks' own, so the file carries
 them, with its barred gates and the sha256 of the race policy's checkpoint: a race policy of any
 other hash, or a course where those gates are others, is refused.
